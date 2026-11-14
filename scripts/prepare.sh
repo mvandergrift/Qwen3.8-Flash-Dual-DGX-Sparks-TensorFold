@@ -169,6 +169,7 @@ if [[ $REBUILD -eq 1 || "$built_hash" != "$PATCHES_HASH" ]]; then
   docker build "${nocache[@]}" -t "$IMAGE" --build-arg BASE_IMAGE="$BASE_IMAGE" \
     --build-arg TF_REPO="$TF_REPO" --build-arg TF_REF="$TF_REF" \
     --build-arg ZIG_VERSION="$ZIG_VERSION" --build-arg ZIG_SHA256="$ZIG_SHA256" \
+    --build-arg XGRAMMAR_REPO="$XGRAMMAR_REPO" --build-arg XGRAMMAR_REF="$XGRAMMAR_REF" \
     --build-arg PATCHES_HASH="$PATCHES_HASH" --build-arg KERNELS="$kernels" \
     --build-arg KERNEL_SOURCE_MTIME="$KERNEL_SOURCE_MTIME" \
     -f - "$ctx" <<'DOCKERFILE'
@@ -185,12 +186,21 @@ ARG TF_REF
 RUN git init -q /tensorfold && cd /tensorfold && git remote add origin "${TF_REPO}" && \
     git fetch -q --depth 1 origin "${TF_REF}" && git checkout -q --detach FETCH_HEAD && \
     test "$(git rev-parse HEAD)" = "${TF_REF}"
+# xgrammar at its pinned tag (libtfgrammar, patch 0013, is built from it below); only dlpack's headers are needed from its submodules
+ARG XGRAMMAR_REPO
+ARG XGRAMMAR_REF
+RUN git init -q /xgrammar && cd /xgrammar && git remote add origin "${XGRAMMAR_REPO}" && \
+    git fetch -q --depth 1 origin "${XGRAMMAR_REF}" && git checkout -q --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${XGRAMMAR_REF}" && git submodule update -q --init --depth 1 3rdparty/dlpack
 COPY patches /opt/tf-patches
 RUN cd /tensorfold && \
     for p in /opt/tf-patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done
 RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=fast --prefix /opt/tensorfold \
       -j"$(nproc)" fatbins install native && \
     test -x /opt/tensorfold/native/bin/tensorfold-native
+# libtfgrammar.so for structured output (response_format, guided_*): the server loads it by name when the first such request arrives
+RUN cd /tensorfold && /opt/zig/zig build grammar -Dxgrammar=/xgrammar --prefix /opt/tensorfold -j"$(nproc)" && \
+    test -f /opt/tensorfold/native/lib/libtfgrammar.so
 RUN mkdir -p /opt/tensorfold/share/doc/tensorfold && cd /tensorfold && \
     for f in LICENSE LICENSE.md LICENSES NOTICE THIRD_PARTY_NOTICES.md; do \
       if [ -e "$f" ]; then cp -a "$f" /opt/tensorfold/share/doc/tensorfold/ || exit 1; fi; done
@@ -210,6 +220,7 @@ COPY --from=build /opt/tensorfold /opt/tensorfold
 # TensorFold's Python tree for the vision helper (python3 -m tensorfold.vision.native_helper, started by --vision)
 COPY --from=build /tensorfold/src/tensorfold /opt/tensorfold/python/tensorfold
 RUN ln -s /opt/tensorfold/native/bin/tensorfold-native /usr/local/bin/tensorfold-native && \
+    ln -s /opt/tensorfold/native/lib/libtfgrammar.so /usr/local/lib/libtfgrammar.so && ldconfig && \
     pip install --no-cache-dir "huggingface_hub>=1.0" && \
     pip install --no-cache-dir --no-deps "transformers==5.17.0" "av==19.0.1"
 ARG PATCHES_HASH

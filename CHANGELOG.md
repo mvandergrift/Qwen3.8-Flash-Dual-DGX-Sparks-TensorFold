@@ -5,8 +5,22 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
-Patches `0010`-`0012` change the engine, so the image hash changes: setup builds the image locally until one is
+Patches `0010`-`0013` change the engine, so the image hash changes: setup builds the image locally until one is
 published for these patches (the v1.1 digest in `scripts/config.sh` does not apply).
+
+### Added
+- **Structured output** ([#11](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/issues/11), `0013`):
+  `response_format` (`json_object`, `json_schema`), `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar` and
+  `structured_outputs` are enforced instead of refused with HTTP 400. TensorFold's lane-core grammar
+  ([PR #596](https://github.com/ashhart/TensorFold/pull/596), BobClawblaw) and per-draw masking
+  ([PR #1062](https://github.com/ashhart/TensorFold/pull/1062), Mirrdhyn) are ported to this engine's older core and its
+  vocabulary-split two-rank draws: the masks apply on rank 0 to the gathered candidates, with no new GPU kernel and no
+  change to the ranks' wire protocol (see the README's [Structured output](README.md#structured-output)). The image build
+  now also builds `libtfgrammar` from xgrammar v0.2.8 (`XGRAMMAR_REF` in `scripts/config.sh`). `tools/structured_check.py`
+  checks it against a running server.
+  **Status:** the lane core, the sampler, the lane backend and the two-rank mirror are covered by host tests (all pass on
+  Linux arm64; `libtfgrammar` was exercised against a real tokenizer), and the CUDA server cross-compiles. It has **not**
+  been run on a GB10 pair: run `tools/structured_check.py` before relying on it.
 
 ### Fixed
 - **A segfault in `endPass` under a full prompt cache, and a state rank 1 kept that rank 0 had freed**

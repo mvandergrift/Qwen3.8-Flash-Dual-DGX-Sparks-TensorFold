@@ -65,6 +65,10 @@ MODEL_REVISION="${MODEL_REVISION-$_rev}"
 # image (/opt/tensorfold); TensorFold's Python package is not installed.
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
 TF_REF="${TF_REF:-db281878ddb836fd0df510d8771ecb7e0fe47d26}"   # zig-flashnext
+# libtfgrammar (structured output, patch 0013): xgrammar's C++ library behind TensorFold's grammar shim, built in the image
+# from this tag (the shim is written and checked against it) and loaded by the server when a structured request arrives.
+XGRAMMAR_REPO="${XGRAMMAR_REPO:-https://github.com/mlc-ai/xgrammar.git}"
+XGRAMMAR_REF="${XGRAMMAR_REF:-97787376faee5ed8466cfad57c99855e4ce2f6aa}"   # v0.2.8
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"   # zig-aarch64-linux-0.17.0.tar.xz
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
@@ -84,7 +88,7 @@ image_hash() {
   ( cd "$_cfg_root" || exit 1
     cat patches/*.patch 2>/dev/null
     sed -n "/<<'DOCKERFILE'/,/^DOCKERFILE\$/p" scripts/prepare.sh   # the Dockerfile itself
-    echo "$TF_REPO $TF_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE kernel-mtime-$KERNEL_SOURCE_MTIME"
+    echo "$TF_REPO $TF_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE kernel-mtime-$KERNEL_SOURCE_MTIME $XGRAMMAR_REPO $XGRAMMAR_REF"
   ) | sha256sum | cut -c1-12
 }
 GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-dual-dgx-sparks-tensorfold}"

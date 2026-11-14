@@ -46,6 +46,15 @@ TensorFold
   (https://github.com/ashhart/TensorFold/pull/443, commit 59e77e8f4b875ce0e863a8c896fc8e424bc539ac), part of
   TensorFold under its licenses above.
 
+xgrammar
+  https://github.com/mlc-ai/xgrammar
+  Copyright (c) 2024 by XGrammar Contributors. Apache License, Version 2.0. xgrammar's NOTICE reads: "XGrammar /
+  Copyright (c) 2024 by XGrammar Contributors".
+  The image build clones xgrammar at the commit pinned in scripts/config.sh (v0.2.8) and compiles it, with its picojson
+  (BSD-2-Clause, Copyright 2009-2010 Cybozu Labs, Inc. and 2011-2014 Kazuho Oku) and dlpack (Apache-2.0, DLPack
+  contributors) headers, into libtfgrammar.so beside TensorFold's shim (patch 0013), which carries structured output
+  (response_format, guided_*). Only the built library reaches the image.
+
 Zig
   https://ziglang.org
   Copyright (c) Zig contributors. The MIT License (Expat). Zig is developed by the Zig Software Foundation and the

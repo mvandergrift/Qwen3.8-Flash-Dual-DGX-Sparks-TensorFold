@@ -72,6 +72,14 @@ third-party notices that go with it (TensorFold's MIT and Apache-2.0 notices, Zi
   [#6](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/issues/6)) were written by Drake Lu
   ([xinlu8439](https://github.com/xinlu8439)), with their regression tests, in those issues; jeff-defuser
   ([jeff-defuser](https://github.com/jeff-defuser)) confirmed `0010` on a second setup.
+- **Structured output.** `patches/0013` adapts, to this engine's older lane core and two-rank draws, TensorFold's
+  structured-output work: the `libtfgrammar` shim over xgrammar, the lane core's grammar masks and windows, and the server's
+  grammar compiler from [TensorFold PR #596](https://github.com/ashhart/TensorFold/pull/596) by BobClawblaw
+  ([BobClawblaw](https://github.com/BobClawblaw)), and the per-draw masking of
+  [TensorFold PR #1062](https://github.com/ashhart/TensorFold/pull/1062) (carried in 1.1.2) by Denis L
+  ([Mirrdhyn](https://github.com/Mirrdhyn)). `tools/structured_check.py` is adapted from TensorFold's
+  `tools/zig/structured_served.py` (PR #596). The masked draw over the two ranks' gathered candidates is new code written for
+  this engine. TensorFold is Apache-2.0; xgrammar is by the MLC AI team (Apache-2.0).
 
 ## Runtime stack
 

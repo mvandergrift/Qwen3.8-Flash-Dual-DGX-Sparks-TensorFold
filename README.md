@@ -425,9 +425,35 @@ These all work on the Flash Next TP=2 path; `"draft": false` gives the serial re
   opens a tool call.
 - Prompt reuse: a conversation's next turn resumes from the kept state of its earlier turns instead of prefilling the
   whole prompt again (`tools/prompt_reuse.py`); image and video prompts are not kept.
-- Structured outputs (`response_format`, the `guided_*` fields) are refused with HTTP 400: this engine does not enforce
-  them yet.
+- Structured outputs (`response_format` with `json_object` or `json_schema`, `guided_json`, `guided_regex`,
+  `guided_choice`, `guided_grammar`, `structured_outputs`) are enforced by the engine: see
+  [Structured output](#structured-output). They cannot be combined with `tool_choice: "required"`.
 - Images and video: see [Images and video](#images-and-video).
+
+## Structured output
+
+`response_format` (`json_object`, `json_schema`), `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar` and
+`structured_outputs` are enforced with xgrammar, through `libtfgrammar` (TensorFold's shim, built into the image from
+xgrammar v0.2.8 and loaded when the first structured request arrives; a server without it still serves text and
+answers a structured request with HTTP 400 naming the library). With thinking on, the grammar starts after the
+thinking block closes. Patch `0013` brings this from TensorFold's lane core (PR #596) to this engine and applies
+the per-draw masking idea of PR #1062; it is written for two ranks.
+
+How it works here: every token a grammar stream commits is drawn among the tokens its grammar allows. The mask is applied
+on rank 0 to the candidates the two ranks already gather for each draw (each rank's top 32), so the GPU kernels, the
+CUDA graphs and the ranks' wire protocol are unchanged; rank 1 makes the same calls with its own unmasked draws, which
+nothing reads. Drafted rounds equal `"draft": false`, and concurrent equal solo, as for text.
+
+What to know:
+- **A grammar chooses among the model's top 64 candidates (32 a rank).** A row whose candidates hold no allowed token
+  takes the lowest allowed token id, so the reply stays valid but that token is not the model's choice; the log says
+  so once (`structured output: a row's candidates held no token its grammar allows`). A schema the model follows
+  never hits this; a grammar that forces a token the model finds very unlikely can.
+- **Grammar replies draft from the prompt only**: the MTP head's drafts are not verified under a grammar, so the
+  speedup the head gives text does not apply (copy drafts from the prompt still do).
+- **Unconstrained requests take the path they took before**: their draws, drafts and token hashes are produced by the same code.
+- `tools/structured_check.py` checks all of it against a running server: every grammar kind valid, drafted equal to
+  `"draft": false`, concurrent equal to alone, and the refusals.
 
 ## Checks
 
@@ -449,6 +475,7 @@ checked and failed, 2 when it could not run, 3 when it ran but could not verify 
 | `tools/toolcheck.py` | a tool call with an array argument comes back as a JSON array, streamed the same, and a tool result turn answers from it |
 | `tools/prompt_reuse.py [size] [turns]` | a conversation takes more turns, each resuming at least 90% of its prompt from the kept state |
 | `tools/exact.py` | the same greedy requests one at a time, with `"draft": false`, and all at once: the replies must be identical |
+| `tools/structured_check.py` | every structured-output kind returns a valid reply, drafted equals `"draft": false`, concurrent equals alone, and the malformed requests are refused |
 | `tools/client.py "message"` | one chat request (thinking off unless `--think`), for a quick look |
 
 ## Repository layout
@@ -459,7 +486,7 @@ stop.sh       stop them
 scripts/      config.sh (all settings), local.sh.example (this setup's WORKER), prepare.sh (image + checkpoint on both
               Sparks), nodes.sh (ssh and the RoCE link), publish-image.sh (push the image to GHCR),
               banner.sh (start.sh's banner)
-tools/        checks against the running server (needle, long context, tool calls, prompt reuse, exactness)
+tools/        checks against the running server (needle, long context, tool calls, prompt reuse, exactness, structured output)
 CHANGELOG.md  what changed in each release
 CREDITS.md    who and what this builds on
 LICENSE       Apache License 2.0
@@ -469,7 +496,7 @@ NOTICE        third-party notices (TensorFold's MIT and Apache-2.0 notices, Zig,
 `patches/` holds the Zig engine's Flash Next port (`0001`-`0009`: build and server flags, the CUDA kernels, config
 and weights, the Triton replay, the engine, two ranks, serving, the kernel spec, TensorFold's Python vision helper) and its
 fixes (`0010`-`0012`: the prompt cache's eviction inside a pass, the ranks' prefill admission, the control link's record
-order), applied to TensorFold's source in
+order) and structured output (`0013`: libtfgrammar, the lane core's grammar masks, the masked draws), applied to TensorFold's source in
 filename order by `prepare.sh` (`git apply` in the checkout's root); the kernel set is compiled in the image build.
 
 ## License
