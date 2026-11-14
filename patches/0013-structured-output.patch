@@ -1077,15 +1077,15 @@ index a76e4ed..c3c77c1 100644
  
  pub fn rowParents(e: *Engine, w: be.Window) ![]const i32 {
 diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
-index 9f2ec3a..aed0412 100644
+index 9f2ec3a..89c218d 100644
 --- a/zig/src/families/flashnext/cuda_engine.zig
 +++ b/zig/src/families/flashnext/cuda_engine.zig
 @@ -310,6 +310,8 @@ pub const Engine = struct {
      cand_have: u64 = std.math.maxInt(u64),
      /// TF_FLASHNEXT_DRAW_ONCE=0: each window's and draft's draws read the candidates again (the old way)
      draw_once: bool = true,
-+    /// structured output: rows whose candidates held no allowed token (the lowest allowed id was taken)
-+    mask_missed: u64 = 0,
++    /// structured output: what the masked draws did so far (rank 0), for the log
++    mask_stats: sampler.MaskStats = .{},
      /// generateMany's served hybrid (gate-many --served): a running product applies while at most this many streams
      /// are live, `wide_confidence` above (maxInt: the request's rule always)
      product_streams: usize = std.math.maxInt(usize),
@@ -1102,7 +1102,7 @@ index 9f2ec3a..aed0412 100644
          e.f.finishMedia(seq);
          var first: [1]u32 = undefined;
          try e.draw(e.last_logits, e.last_cand, 1, prompt.len, &first);
-+        if (o.mask.len > 0) try e.maskDraw(e.last_cand, 1, 0, 1, prompt.len, e.sampling, o.mask, &first);
++        if (o.mask.len > 0) try e.maskDraw(e.last_cand, e.last_logits, 1, 0, 1, prompt.len, e.sampling, o.mask, &first);
          if (e.pass_times) {
              pw[3] = try e.passLap(&t_pw);
              if (e.rank == 0) std.log.info("prefillWith {d} tokens{s}{s}: restore {d:.1} ms, {d} forwards {d:.1} ms, absorbs + commits {d:.1} ms, draw {d:.1} ms", .{ prompt.len, if (o.resume_from != null) " (resumed)" else "", if (o.keep_at != null) " (kept)" else "", pw[0], pw_chunks, pw[1], pw[2], pw[3] });
@@ -1119,7 +1119,7 @@ index 9f2ec3a..aed0412 100644
          for (prompts, 0..) |p, i| {
              const s: ?lanes.Sampling = if (p.sampling) |x| (if (x.temperature > 0) x else null) else null;
              try e.drawRows(lg, pb.b.cand_all, n, i, 1, p.prompt.len, s, firsts[i .. i + 1]);
-+            if (p.mask.len > 0) try e.maskDraw(pb.b.cand_all, n, i, 1, p.prompt.len, s, p.mask, firsts[i .. i + 1]);
++            if (p.mask.len > 0) try e.maskDraw(pb.b.cand_all, lg, n, i, 1, p.prompt.len, s, p.mask, firsts[i .. i + 1]);
          }
      }
  
@@ -1152,11 +1152,11 @@ index 9f2ec3a..aed0412 100644
                  e.f.finishMedia(seq);
                  var first: [1]u32 = undefined;
                  try e.drawRows(e.last_logits, e.last_cand, 1, 0, 1, fl.prompt.len, fl.sampling, &first);
-+                if (fl.mask.len > 0) try e.maskDraw(e.last_cand, 1, 0, 1, fl.prompt.len, fl.sampling, fl.mask, &first);
++                if (fl.mask.len > 0) try e.maskDraw(e.last_cand, e.last_logits, 1, 0, 1, fl.prompt.len, fl.sampling, fl.mask, &first);
                  fl.first = first[0];
                  fl.done = true;
                  return true;
-@@ -1362,6 +1373,44 @@ pub const Engine = struct {
+@@ -1362,6 +1373,74 @@ pub const Engine = struct {
          try e.drawRows(e.buf.b.logits, e.buf.b.cand_all, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
      }
  
@@ -1168,15 +1168,15 @@ index 9f2ec3a..aed0412 100644
 +        const sg = e.round_segs[i];
 +        const smp: ?lanes.Sampling = if (s) |x| (if (x.temperature > 0) x else null) else null;
 +        const total = e.round_segs[e.round_n - 1].a1;
-+        try e.maskDraw(e.buf.b.cand_all, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, masks, out);
++        try e.maskDraw(e.buf.b.cand_all, e.buf.b.logits, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, masks, out);
 +    }
 +
 +    /// Structured output: rows [row0, row0 + rows) of a forward's `total` rows redrawn over the gathered candidates the
 +    /// grammar allows (`masks`: rows x words of allowed-token bits), keyed as the plain draw is. The plain draw has run
-+    /// already, so the collectives a draw has stay paired with rank 1's, which draws unmasked and whose draws
-+    /// nothing reads. A grammar can only choose among tokens the ranks offered (top CAND each); a row with none
-+    /// allowed among them takes the lowest allowed id, counted in `mask_missed`.
-+    fn maskDraw(e: *Engine, cand_all: u64, total: usize, row0: usize, rows: usize, first_position: u64, s: ?lanes.Sampling, masks: []const u32, out: []u32) !void {
++    /// already, so the collectives a draw has stay paired with rank 1's, which draws unmasked and whose draws nothing
++    /// reads. A row the ranks' top CAND candidates do not settle takes this rank's own vocabulary shard from `logits_base`
++    /// (the forward's rows, this rank's shard each), scanned on the host under the mask; see sampler.chooseGatheredMasked.
++    fn maskDraw(e: *Engine, cand_all: u64, logits_base: u64, total: usize, row0: usize, rows: usize, first_position: u64, s: ?lanes.Sampling, masks: []const u32, out: []u32) !void {
 +        if (e.world < 2) return error.StructuresNeedTwoRanks;
 +        if (rows > state.max_rows or masks.len % rows != 0) return error.GatheredShape;
 +        const width = 2 * state.cand + 1;
@@ -1189,14 +1189,44 @@ index 9f2ec3a..aed0412 100644
 +        var positions: [state.max_rows]u64 = undefined;
 +        var draws: [state.max_rows]sampler.Draw = undefined;
 +        for (0..rows) |r| positions[r] = first_position + r;
-+        var missed: usize = 0;
-+        try sampler.chooseGatheredMasked(e.gpa, got, e.world, rows, positions[0..rows], s, masks, draws[0..rows], &missed);
++        var shard: LocalShard = .{ .e = e, .logits = logits_base, .row0 = row0 };
++        var stats: sampler.MaskStats = .{};
++        try sampler.chooseGatheredMasked(e.gpa, got, e.world, rows, positions[0..rows], s, masks, shard.scan(), draws[0..rows], &stats);
 +        for (out[0..rows], draws[0..rows]) |*o, dr| o.* = @intCast(dr.token);
-+        if (missed > 0) {
-+            if (e.mask_missed == 0 and e.rank == 0) std.log.warn("structured output: a row's candidates held no token its grammar allows; the lowest allowed id was taken (later ones are counted)", .{});
-+            e.mask_missed += missed;
++        const t = &e.mask_stats;
++        t.forced += stats.forced;
++        t.certified += stats.certified;
++        t.scanned += stats.scanned;
++        // a row the scan could not prove, or with nothing allowed among the candidates: said for the first few, then every 1000th
++        const odd = stats.inexact + stats.missed;
++        if (odd > 0 and e.rank == 0) {
++            const before = t.inexact + t.missed;
++            t.inexact += stats.inexact;
++            t.missed += stats.missed;
++            if (before < 5 or (before + odd) / 1000 != before / 1000) std.log.warn("structured output: {d} masked rows not proven the best allowed token ({d} with none allowed among the candidates, taking the lowest allowed id); so far {d} forced, {d} settled by the candidates, {d} by rank 0's shard, {d} unproven, {d} with none", .{ odd, stats.missed, t.forced, t.certified, t.scanned, t.inexact, t.missed });
 +        }
 +    }
++
++    /// This rank's own vocabulary shard of a forward's row, for sampler.chooseGatheredMasked.
++    const LocalShard = struct {
++        e: *Engine,
++        logits: u64, // the forward's rows, each [head_n] bf16
++        row0: usize,
++
++        fn scan(self: *LocalShard) sampler.ShardScan {
++            return .{ .ctx = self, .top = top };
++        }
++
++        fn top(ctx: *anyopaque, row: usize, bits: []const u32, values: []f32, ids: []u64) anyerror!usize {
++            const self: *LocalShard = @ptrCast(@alignCast(ctx));
++            const e = self.e;
++            const V = e.g.head_n;
++            const host = try e.gpa.alloc(u16, V);
++            defer e.gpa.free(host);
++            try e.read(self.logits + (self.row0 + row) * V * 2, std.mem.sliceAsBytes(host));
++            return sampler.topAllowed(host, @intCast(e.f.vocab_offset), bits, values, ids);
++        }
++    };
 +
      /// Keep window `i`'s first `keep` rows (its stream's commit, at its rows of the shared window).
      pub fn commitWindow(e: *Engine, i: usize, keep: usize) !void {
@@ -1617,46 +1647,130 @@ index f20517a..6c53962 100644
  /// --vision: rank 0's vision helper (tensorfold.vision.native_helper) encodes on this GPU beside the engine; its
  /// transient workspace is kept out of the sequences' budget (TENSORFOLD_VISION_WORKSPACE_MIB, 4096 by default
 diff --git a/zig/src/families/flashnext/cuda_sampler.zig b/zig/src/families/flashnext/cuda_sampler.zig
-index b1bd422..c5759cb 100644
+index b1bd422..b4d0800 100644
 --- a/zig/src/families/flashnext/cuda_sampler.zig
 +++ b/zig/src/families/flashnext/cuda_sampler.zig
-@@ -91,6 +91,52 @@ pub fn chooseGathered(gpa: Allocator, got: []const f32, world: usize, rows: usiz
+@@ -91,6 +91,136 @@ pub fn chooseGathered(gpa: Allocator, got: []const f32, world: usize, rows: usiz
      }
  }
  
-+/// `chooseGathered` for structured output: row r's draw is over the gathered candidates its allowed-token bits
-+/// (`masks`, `rows` rows of masks.len / rows words, token t at bit t % 32 of word t / 32) let through, as the keyed
-+/// rule draws over a vocabulary cut to them. A greedy draw is the highest allowed candidate; a row whose
-+/// candidates hold no allowed token takes the lowest allowed id (the grammar stays satisfied; the model's score for
-+/// it is not known), and `missed` counts those rows. Never fails on a grammar: the mask only removes candidates.
-+pub fn chooseGatheredMasked(gpa: Allocator, got: []const f32, world: usize, rows: usize, positions: []const u64, s: ?S.Sampling, masks: []const u32, out: []Draw, missed: *usize) !void {
++/// What the masked draws did, for the log: rows with one allowed token, rows the gathered candidates alone settled, rows
++/// that needed rank 0's own shard scanned, rows still not proven the masked best after it, rows with no allowed candidate.
++pub const MaskStats = struct { forced: usize = 0, certified: usize = 0, scanned: usize = 0, inexact: usize = 0, missed: usize = 0 };
++
++/// Rank 0's own vocabulary shard of one row, for a grammar row the gathered candidates do not settle: the shard's best
++/// `values.len` allowed tokens by value (ties by id) with global ids in `ids`, and how many it found (fewer than asked:
++/// every allowed token of the shard).
++pub const ShardScan = struct {
++    ctx: *anyopaque,
++    top: *const fn (ctx: *anyopaque, row: usize, bits: []const u32, values: []f32, ids: []u64) anyerror!usize,
++};
++
++/// How many of the shard's best allowed tokens a scan asks for.
++pub const scan_width = 64;
++
++/// `chooseGathered` for structured output: row r's draw is over the tokens its allowed-token bits (`masks`, `rows` rows
++/// of masks.len / rows words, token t at bit t % 32 of word t / 32) let through, as the keyed rule draws over a vocabulary
++/// cut to them. The ranks gathered only their top `cand` values, so the allowed candidates are the masked best tokens only
++/// when enough of them reach the value at or below which every token a rank left out lies (`certifiedAt`). A row that is
++/// not certified takes rank 0's shard from `scan` (exact, so that shard stops limiting it) and is checked again; one that
++/// still is not is drawn over what there is (`stats.inexact`). A row with one allowed token takes it; a row with none among
++/// the candidates takes the lowest allowed id (`stats.missed`). The mask only removes tokens: the reply stays in the grammar.
++pub fn chooseGatheredMasked(gpa: Allocator, got: []const f32, world: usize, rows: usize, positions: []const u64, s: ?S.Sampling, masks: []const u32, scan: ?ShardScan, out: []Draw, stats: *MaskStats) !void {
 +    const width = 2 * cand + 1;
 +    if (got.len < world * rows * width or positions.len != rows or out.len != rows or rows == 0 or masks.len % rows != 0) return error.GatheredShape;
 +    const words = masks.len / rows;
-+    const values = try gpa.alloc(f32, world * cand);
++    const values = try gpa.alloc(f32, world * cand + scan_width);
 +    defer gpa.free(values);
-+    const ids = try gpa.alloc(u64, world * cand);
++    const ids = try gpa.alloc(u64, world * cand + scan_width);
 +    defer gpa.free(ids);
++    var scan_v: [scan_width]f32 = undefined;
++    var scan_id: [scan_width]u64 = undefined;
 +    for (0..rows) |r| {
 +        const bits = masks[r * words ..][0..words];
++        var popcount: usize = 0;
++        for (bits) |w| popcount += @popCount(w);
++        if (popcount == 0) return error.NoAllowedToken;
++        if (popcount == 1) {
++            stats.forced += 1;
++            out[r] = .{ .token = lowestAllowed(bits).? };
++            continue;
++        }
++        // how many of the best allowed tokens the draw reads: one for greedy, top_k when sampled (a nucleus over all: cand)
++        const need: usize = if (s == null or s.?.temperature <= 0) 1 else if (s.?.top_k == 0) cand else s.?.top_k;
++        // the gathered candidates the grammar allows (rank 0's first), and the value each rank's unlisted tokens lie at or below
 +        var n: usize = 0;
++        var rank0: usize = 0; // how many of them are rank 0's
++        var below_all = -std.math.inf(f32);
++        var below_rest = -std.math.inf(f32); // over ranks 1.. only
 +        for (0..world) |k| {
 +            const row = got[(k * rows + r) * width ..][0..width];
++            var least = std.math.inf(f32);
 +            for (0..cand) |j| {
++                least = @min(least, row[j]);
 +                const id: i64 = @as(i32, @bitCast(@as(u32, @bitCast(row[cand + j]))));
 +                if (id < 0 or !allowedBit(bits, @intCast(id))) continue;
 +                values[n] = row[j];
 +                ids[n] = @intCast(id);
 +                n += 1;
 +            }
++            if (k == 0) rank0 = n;
++            below_all = @max(below_all, least);
++            if (k > 0) below_rest = @max(below_rest, least);
 +        }
++        if (certifiedAt(values[0..n], need, below_all)) {
++            stats.certified += 1;
++        } else if (scan) |sc| {
++            // rank 0's shard from its own logits: its gathered candidates go, the scan's best allowed tokens take their place
++            std.mem.copyForwards(f32, values[0 .. n - rank0], values[rank0..n]);
++            std.mem.copyForwards(u64, ids[0 .. n - rank0], ids[rank0..n]);
++            n -= rank0;
++            const found = try sc.top(sc.ctx, r, bits, &scan_v, &scan_id);
++            @memcpy(values[n..][0..found], scan_v[0..found]);
++            @memcpy(ids[n..][0..found], scan_id[0..found]);
++            n += found;
++            // a full scan leaves out tokens at or below its last; a short one listed every allowed token of the shard
++            const shard_floor = if (found == scan_width) scan_v[found - 1] else -std.math.inf(f32);
++            stats.scanned += 1;
++            if (!certifiedAt(values[0..n], need, @max(below_rest, shard_floor))) stats.inexact += 1;
++        } else if (n > 0) stats.inexact += 1;
 +        if (n == 0) {
-+            missed.* += 1;
-+            out[r] = .{ .token = lowestAllowed(bits) orelse return error.NoAllowedToken };
++            stats.missed += 1;
++            out[r] = .{ .token = lowestAllowed(bits).? };
 +            continue;
 +        }
 +        out[r] = try drawRow(gpa, values[0..n], ids[0..n], positions[r], s, null);
 +    }
++}
++
++/// A shard's row of bf16 logits (`row`, token ids `offset` + index): its best `values.len` allowed tokens by value, ties
++/// by id, in `values` and `ids`; how many there were (fewer than asked: all of the shard's allowed tokens).
++pub fn topAllowed(row: []const u16, offset: u64, bits: []const u32, values: []f32, ids: []u64) usize {
++    var n: usize = 0;
++    for (row, 0..) |h, i| {
++        const id = offset + i;
++        if (!allowedBit(bits, id)) continue;
++        const v: f32 = @bitCast(@as(u32, h) << 16);
++        if (std.math.isNan(v)) continue;
++        if (n == values.len and v <= values[n - 1]) continue; // a later id never beats an equal value
++        var at = if (n < values.len) n else n - 1;
++        while (at > 0 and v > values[at - 1]) : (at -= 1) {
++            values[at] = values[at - 1];
++            ids[at] = ids[at - 1];
++        }
++        values[at] = v;
++        ids[at] = id;
++        if (n < values.len) n += 1;
++    }
++    return n;
++}
++
++/// At least `need` of the candidates' values reach `floor`, the value every token a rank left out stays at or below: the
++/// best `need` allowed tokens are among them, so the draw over them is the draw over the whole vocabulary.
++fn certifiedAt(values: []const f32, need: usize, floor: f32) bool {
++    var reach: usize = 0;
++    for (values) |v| reach += @intFromBool(v >= floor);
++    return reach >= need;
 +}
 +
 +fn allowedBit(bits: []const u32, token: usize) bool {
@@ -1673,44 +1787,139 @@ index b1bd422..c5759cb 100644
  test "gathered draws and probabilities equal Python's choose_gathered" {
      const gpa = std.testing.allocator;
      const text = @embedFile("fixtures_cuda_gathered.json");
-@@ -148,3 +194,38 @@ test "the gathered candidates cover top_k 20 and greedy, not top_k 30" {
+@@ -148,3 +278,133 @@ test "the gathered candidates cover top_k 20 and greedy, not top_k 30" {
      try std.testing.expect(!gatheredFits(.{ .seed = 1, .top_k = 0 }));
      try std.testing.expect(gatheredFits(.{ .seed = 1, .temperature = 0 }));
  }
 +
-+test "a masked draw takes the best allowed candidate, a miss the lowest allowed id, and a sampled draw stays inside the mask" {
-+    const gpa = std.testing.allocator;
++/// Words of a mask over the test vocabulary (ids below 1280).
++const W = 40;
++
++/// Two ranks' candidates for `rows` rows: rank k's j-th candidate has id 1000 * k + j and value 40 - j - 10 * k; lse 0.
++fn testCandidates(got: []f32, rows: usize) void {
 +    const width = 2 * cand + 1;
-+    // two ranks, two rows; rank k's candidates: ids 100k + j with value 40 - j (j = 0..31), lse 0
-+    var got: [2 * 2 * width]f32 = undefined;
-+    for (0..2) |k| for (0..2) |r| {
-+        const row = got[(k * 2 + r) * width ..][0..width];
++    for (0..2) |k| for (0..rows) |r| {
++        const row = got[(k * rows + r) * width ..][0..width];
 +        for (0..cand) |j| {
-+            row[j] = @floatFromInt(40 - @as(i32, @intCast(j)));
-+            row[cand + j] = @bitCast(@as(u32, @bitCast(@as(i32, @intCast(100 * k + j)))));
++            row[j] = @floatFromInt(40 - @as(i32, @intCast(j)) - 10 * @as(i32, @intCast(k)));
++            row[cand + j] = @bitCast(@as(u32, @bitCast(@as(i32, @intCast(1000 * k + j)))));
 +        }
 +        row[2 * cand] = 0;
 +    };
-+    var masks: [2 * 8]u32 = @splat(0);
-+    // row 0 allows 3, 7 (rank 0) and 103 (rank 1); row 1 allows only 250, which no rank offered
-+    for ([_]u32{ 3, 7, 103 }) |t| masks[t / 32] |= @as(u32, 1) << @intCast(t % 32);
-+    masks[8 + 250 / 32] |= @as(u32, 1) << @intCast(250 % 32);
-+    var out: [2]Draw = undefined;
-+    var missed: usize = 0;
-+    try chooseGatheredMasked(gpa, &got, 2, 2, &.{ 5, 6 }, null, &masks, &out, &missed);
-+    try std.testing.expectEqual(@as(u64, 3), out[0].token); // value 37 beats 7's 33 and 103's 37 (lowest id on the tie)
-+    try std.testing.expectEqual(@as(u64, 250), out[1].token);
-+    try std.testing.expectEqual(@as(usize, 1), missed);
-+    const smp: S.Sampling = .{ .seed = 3, .temperature = 1.0, .top_k = 20, .top_p = 0.95 };
-+    for (0..50) |position| {
-+        missed = 0;
-+        try chooseGatheredMasked(gpa, &got, 2, 2, &.{ position, position + 1 }, smp, &masks, &out, &missed);
-+        try std.testing.expect(out[0].token == 3 or out[0].token == 7 or out[0].token == 103);
-+        try std.testing.expectEqual(@as(u64, 250), out[1].token);
++}
++
++fn setBits(bits: []u32, tokens: []const u32) void {
++    for (tokens) |t| bits[t / 32] |= @as(u32, 1) << @intCast(t % 32);
++}
++
++/// A shard scan over a synthetic rank 0 row: token t (0..999) scores 100 - t / 5 (so the best allowed is the lowest id).
++const TestShard = struct {
++    calls: usize = 0,
++    fn scan(self: *TestShard) ShardScan {
++        return .{ .ctx = self, .top = top };
 +    }
-+    // an empty mask row has nothing to take
-+    var none: [2 * 8]u32 = @splat(0);
-+    try std.testing.expectError(error.NoAllowedToken, chooseGatheredMasked(gpa, &got, 2, 2, &.{ 5, 6 }, null, &none, &out, &missed));
++    fn top(ctx: *anyopaque, row: usize, bits: []const u32, values: []f32, ids: []u64) anyerror!usize {
++        _ = row;
++        const self: *TestShard = @ptrCast(@alignCast(ctx));
++        self.calls += 1;
++        var n: usize = 0;
++        for (0..1000) |t| {
++            if (!allowedBit(bits, t) or n == values.len) continue;
++            values[n] = @floatFromInt(@as(i32, 100) - @as(i32, @intCast(t / 5)));
++            ids[n] = t;
++            n += 1;
++        }
++        return n;
++    }
++};
++
++test "a masked draw settled by the candidates needs no scan, and one allowed token is taken as it is" {
++    const gpa = std.testing.allocator;
++    const width = 2 * cand + 1;
++    var got: [2 * 2 * width]f32 = undefined;
++    testCandidates(&got, 2);
++    var masks: [2 * W]u32 = @splat(0);
++    setBits(masks[0..W], &.{ 3, 7, 1003 }); // values 37, 33 and 27, all above the 9 that rank 0 left out and the -1 rank 1 did
++    setBits(masks[W..], &.{250});
++    var out: [2]Draw = undefined;
++    var stats: MaskStats = .{};
++    var shard: TestShard = .{};
++    try chooseGatheredMasked(gpa, &got, 2, 2, &.{ 5, 6 }, null, &masks, shard.scan(), &out, &stats);
++    try std.testing.expectEqual(@as(u64, 3), out[0].token);
++    try std.testing.expectEqual(@as(u64, 250), out[1].token);
++    try std.testing.expectEqual(MaskStats{ .forced = 1, .certified = 1 }, stats);
++    try std.testing.expectEqual(@as(usize, 0), shard.calls);
++}
++
++test "a row with no allowed candidate takes rank 0's shard from its own logits, and a row the scan cannot settle says so" {
++    const gpa = std.testing.allocator;
++    const width = 2 * cand + 1;
++    var got: [2 * 1 * width]f32 = undefined;
++    testCandidates(&got, 1);
++    // allowed: 500 and 600 (rank 0's shard, scored 0 and -20... by the scan: 100 - t / 5 = 0 and -20) and rank 1's 1500 (unlisted)
++    var masks: [W]u32 = @splat(0);
++    setBits(&masks, &.{ 500, 600 });
++    var out: [1]Draw = undefined;
++    var stats: MaskStats = .{};
++    var shard: TestShard = .{};
++    try chooseGatheredMasked(gpa, &got, 2, 1, &.{5}, null, &masks, shard.scan(), &out, &stats);
++    // none of 500 or 600 is among the gathered candidates; the scan finds both (fewer than asked: the shard's every
++    // allowed token) and rank 1 left out values at or below its 32nd (9 = 40 - 31 - 10... -1): 500's 0 reaches it
++    try std.testing.expectEqual(@as(u64, 500), out[0].token);
++    try std.testing.expectEqual(MaskStats{ .scanned = 1 }, stats);
++    try std.testing.expectEqual(@as(usize, 1), shard.calls);
++    // without a scan the row is not proven and, with nothing allowed among the candidates, takes the lowest allowed id
++    stats = .{};
++    try chooseGatheredMasked(gpa, &got, 2, 1, &.{5}, null, &masks, null, &out, &stats);
++    try std.testing.expectEqual(@as(u64, 500), out[0].token);
++    try std.testing.expectEqual(MaskStats{ .missed = 1 }, stats);
++    // an allowed token above what rank 1 left out, scanned: settled. One below it: the scan cannot rule rank 1 out
++    var low: [W]u32 = @splat(0);
++    setBits(&low, &.{ 999, 998 }); // scan values 100 - 199 = -99: far below rank 1's unlisted ceiling (-1)
++    stats = .{};
++    try chooseGatheredMasked(gpa, &got, 2, 1, &.{5}, null, &low, shard.scan(), &out, &stats);
++    try std.testing.expectEqual(@as(u64, 998), out[0].token);
++    try std.testing.expectEqual(MaskStats{ .scanned = 1, .inexact = 1 }, stats);
++}
++
++test "a sampled masked draw stays inside the mask, and an empty mask row is refused" {
++    const gpa = std.testing.allocator;
++    const width = 2 * cand + 1;
++    var got: [2 * 1 * width]f32 = undefined;
++    testCandidates(&got, 1);
++    var masks: [W]u32 = @splat(0);
++    setBits(&masks, &.{ 3, 7, 12, 1003, 1010 });
++    var out: [1]Draw = undefined;
++    const smp: S.Sampling = .{ .seed = 3, .temperature = 1.0, .top_k = 4, .top_p = 0.95 };
++    for (0..50) |position| {
++        var stats: MaskStats = .{};
++        try chooseGatheredMasked(gpa, &got, 2, 1, &[_]u64{position}, smp, &masks, null, &out, &stats);
++        try std.testing.expect(std.mem.indexOfScalar(u64, &.{ 3, 7, 12, 1003, 1010 }, out[0].token) != null);
++    }
++    var none: [W]u32 = @splat(0);
++    var stats: MaskStats = .{};
++    try std.testing.expectError(error.NoAllowedToken, chooseGatheredMasked(gpa, &got, 2, 1, &.{5}, null, &none, null, &out, &stats));
++}
++
++test "a shard scan lists the best allowed tokens by value, ties by id, and every allowed token when there are few" {
++    var row: [200]u16 = undefined;
++    for (&row, 0..) |*h, i| h.* = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(i % 50)))) >> 16); // bf16 of 0..49 repeating
++    var bits: [W]u32 = @splat(0);
++    setBits(&bits, &.{ 7, 57, 107, 157, 9, 59, 198 }); // 7 mod 50 = 7 four times, 9 and 59, 198 (= 48)
++    var v: [4]f32 = undefined;
++    var id: [4]u64 = undefined;
++    // the row sits at ids 100.. of the vocabulary: offset 0 here with the bits set at row positions
++    try std.testing.expectEqual(@as(usize, 4), topAllowed(&row, 0, &bits, &v, &id));
++    try std.testing.expectEqualSlices(f32, &.{ 48, 9, 9, 7 }, &v);
++    try std.testing.expectEqualSlices(u64, &.{ 198, 9, 59, 7 }, &id);
++    var few: [8]f32 = undefined;
++    var few_id: [8]u64 = undefined;
++    try std.testing.expectEqual(@as(usize, 7), topAllowed(&row, 0, &bits, &few, &few_id));
++    // an offset shifts the ids the bits are read at
++    var shifted: [W]u32 = @splat(0);
++    setBits(&shifted, &.{ 1007, 1009 });
++    try std.testing.expectEqual(@as(usize, 2), topAllowed(row[0..50], 1000, &shifted, &few, &few_id));
++    try std.testing.expectEqualSlices(u64, &.{ 1009, 1007 }, few_id[0..2]);
 +}
 diff --git a/zig/src/grammar/tf_grammar.cc b/zig/src/grammar/tf_grammar.cc
 new file mode 100644

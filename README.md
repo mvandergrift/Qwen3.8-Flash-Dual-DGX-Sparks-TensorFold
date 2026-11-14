@@ -440,15 +440,20 @@ thinking block closes. Patch `0013` brings this from TensorFold's lane core (PR 
 the per-draw masking idea of PR #1062; it is written for two ranks.
 
 How it works here: every token a grammar stream commits is drawn among the tokens its grammar allows. The mask is applied
-on rank 0 to the candidates the two ranks already gather for each draw (each rank's top 32), so the GPU kernels, the
-CUDA graphs and the ranks' wire protocol are unchanged; rank 1 makes the same calls with its own unmasked draws, which
-nothing reads. Drafted rounds equal `"draft": false`, and concurrent equal solo, as for text.
+on rank 0, so the GPU kernels, the CUDA graphs and the ranks' wire protocol are unchanged; rank 1 makes the same calls
+with its own unmasked draws, which nothing reads. Drafted rounds equal `"draft": false`, and concurrent equal solo, as for
+text. A row's draw starts from the candidates the two ranks already gather (each rank's top 32). When those do not
+prove the best allowed token (the model wants a newline after its thinking and the grammar wants a digit, say), rank 0
+scans its own half of the vocabulary under the mask on the host: exact for that half, which holds the ASCII, digit and
+punctuation tokens a grammar mostly asks for. A row with a single allowed token (the stop token, a forced bracket)
+takes it without reading scores.
 
 What to know:
-- **A grammar chooses among the model's top 64 candidates (32 a rank).** A row whose candidates hold no allowed token
-  takes the lowest allowed token id, so the reply stays valid but that token is not the model's choice; the log says
-  so once (`structured output: a row's candidates held no token its grammar allows`). A schema the model follows
-  never hits this; a grammar that forces a token the model finds very unlikely can.
+- **Rank 1's half of the vocabulary is read through its top 32 only.** If the best allowed token lies there and is
+  not among them, the draw is over what rank 0 can see, which is still inside the grammar but may not be the model's
+  best allowed token. The log says so (`structured output: N masked rows not proven the best allowed token`, the first few
+  times, then every 1000th, with the counts of rows forced, settled by the candidates, settled by rank 0's shard and
+  unproven). A row with no allowed token among anything rank 0 can see takes the lowest allowed id.
 - **Grammar replies draft from the prompt only**: the MTP head's drafts are not verified under a grammar, so the
   speedup the head gives text does not apply (copy drafts from the prompt still do).
 - **Unconstrained requests take the path they took before**: their draws, drafts and token hashes are produced by the same code.

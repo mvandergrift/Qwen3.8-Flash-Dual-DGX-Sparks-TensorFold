@@ -23,6 +23,11 @@ published for these patches (the v1.1 digest in `scripts/config.sh` does not app
   `tools/structured_check.py` passes: every grammar kind valid, greedy and sampled, thinking off and on; drafted equal to
   `"draft": false` in all 32 runs; 32 of 32 concurrent replies equal their run alone; the five refusals answered with HTTP
   400. Not measured yet: the throughput of grammar replies, which draft from the prompt only.
+- **A weak fallback found by that run** (`0013`): when none of the ranks' top-32 candidates was allowed by the grammar
+  (the model wants a newline after its thinking, the grammar wants a digit), the lowest allowed token id was taken, so a
+  date regex answered `0256-07-20`. Rank 0 now scans its own half of the vocabulary under the mask on the host and
+  checks whether the result is provably the best allowed token (exact for that half; rank 1's half stays limited to its
+  top 32, and the log counts rows it could not prove). A row with one allowed token takes it outright.
 - **A first-token bug found by that run** (`0013`): the CUDA host's backend wrapper did not forward the masked first draw,
   so a grammar request with thinking off failed with HTTP 500 `StructuresUnsupported`. Fixed, with a host test that the
   wrapper forwards every optional call.
