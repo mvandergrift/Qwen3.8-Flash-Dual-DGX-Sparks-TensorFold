@@ -70,6 +70,8 @@ def valid(name: str, text: str) -> bool:
             return False
     if name in ("regex", "structured_outputs"):
         return re.fullmatch(DATE, text) is not None
+    if name == "year":
+        return re.fullmatch(r"\d{4}", text) is not None
     if name == "choice":
         return text in CHOICES
     if name == "grammar":
@@ -105,15 +107,60 @@ def answer(reply: dict) -> tuple[str, str]:
     return (m.get("content") or "").strip(), reply["choices"][0].get("finish_reason", "")
 
 
+# Prompts that say the format, so the model's own answer fits the grammar: then masking must change nothing.
+AGREE = [
+    ("regex", "When did the first person walk on the moon? Answer with only the date as YYYY-MM-DD, nothing else.",
+     {"guided_regex": DATE}),
+    ("choice", "Classify the sentiment of 'I loved every minute of this film.' Answer with exactly one word: positive, negative or neutral.",
+     {"guided_choice": CHOICES}),
+    ("year", "In which year did the Carnation Revolution happen in Portugal? Answer with only the year, four digits.",
+     {"guided_regex": r"\d{4}"}),
+]
+
+
+def agreement(url: str, model: str) -> int:
+    """The model's free greedy answer, when it already satisfies the grammar, must be the constrained greedy answer: the
+    mask removes nothing the model would have chosen. A difference is a defect of the engine, not of the prompt."""
+    failures = 0
+    print("agreement: the unconstrained answer, when it fits the grammar, equals the constrained one")
+    for name, prompt, extra in AGREE:
+        for thinking in (False, True):
+            tokens = 3500 if thinking else 400
+            free_body = body(model, prompt, {}, False, thinking, True, tokens)
+            hard_body = body(model, prompt, extra, False, thinking, True, tokens)
+            for b in (free_body, hard_body):
+                if thinking:
+                    b["thinking_budget"] = 2048  # long enough that the model reaches its answer on its own
+            (c1, r1), (c2, r2) = post(url, free_body), post(url, hard_body)
+            if c1 != 200 or c2 != 200:
+                print(f"FAIL {name} thinking={thinking}: HTTP {c1}/{c2} {r1} {r2}")
+                failures += 1
+                continue
+            free, constrained = answer(r1)[0], answer(r2)[0]
+            if not valid(name, free):
+                print(f"skip {name:18} thinking={thinking!s:5} the free answer does not fit the grammar ({free[:40]!r}); constrained {constrained[:40]!r}")
+            elif free == constrained:
+                print(f"ok   {name:18} thinking={thinking!s:5} free == constrained {constrained[:40]!r}")
+            else:
+                failures += 1
+                print(f"FAIL {name:18} thinking={thinking!s:5} free {free[:40]!r} but constrained {constrained[:40]!r}")
+    return failures
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--url", default="http://127.0.0.1:8888")
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--tokens", type=int, default=400)
     ap.add_argument("--thinking-tokens", type=int, default=1200)
+    ap.add_argument("--agreement-only", action="store_true", help="only the free-versus-constrained agreement check")
     args = ap.parse_args()
     with urllib.request.urlopen(args.url + "/v1/models") as r:
         model = json.loads(r.read())["data"][0]["id"]
+    if args.agreement_only:
+        failures = agreement(args.url, model)
+        print("PASS" if failures == 0 else f"FAIL: {failures}")
+        return 0 if failures == 0 else 1
 
     runs = [(name, prompt, extra, sampled, thinking) for (name, prompt, extra) in CASES + PLAIN
             for sampled in (False, True) for thinking in (False, True)]
@@ -167,6 +214,7 @@ def main() -> int:
         ok = code == 400 and words in message
         failures += not ok
         print(f"{'ok  ' if ok else 'FAIL'} refused {label}: HTTP {code} {r.get('error', {}).get('message', message)[:100]!r}")
+    failures += agreement(args.url, model)
     print("PASS" if failures == 0 else f"FAIL: {failures}")
     return 0 if failures == 0 else 1
 
