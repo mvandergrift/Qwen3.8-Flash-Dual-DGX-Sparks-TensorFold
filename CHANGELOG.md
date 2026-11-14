@@ -23,16 +23,19 @@ published for these patches (the v1.1 digest in `scripts/config.sh` does not app
   `tools/structured_check.py` passes: every grammar kind valid, greedy and sampled, thinking off and on; drafted equal to
   `"draft": false` in all 32 runs; 32 of 32 concurrent replies equal their run alone; the five refusals answered with HTTP
   400. Not measured yet: the throughput of grammar replies, which draft from the prompt only.
-- **A weak fallback found by that run** (`0013`): when none of the ranks' top-32 candidates was allowed by the grammar
-  (the model wants a newline after its thinking, the grammar wants a digit), the lowest allowed token id was taken, so a
-  date regex answered `0256-07-20`. Rank 0 now scans its own half of the vocabulary under the mask on the host and
-  checks whether the result is provably the best allowed token (exact for that half; rank 1's half stays limited to its
-  top 32, and the log counts rows it could not prove). A row with one allowed token takes it outright.
-- **The grammar started too early with thinking on** (`0013`): it constrained the token straight after `</think>`, where a
-  Qwen model writes `\n\n`, so the model had to pick a digit, a quote or a letter where it expected a newline and its
-  scores meant nothing: a date regex answered `0256-07-20` for the 1969 landing (also with a 4,096-token thinking
-  budget, so not a cut-off). The grammar now waits for the think end and a short trail of tokens after it (the server
-  sends `\n\n`), forced by a one-bit mask, and starts after them.
+- **Two weaknesses found while chasing a wrong-looking date** (`0013`). A date regex asked of a model that was never told
+  the format (`Give the date.`) answered `0256-07-20` and later `7201-07-20` for the 1969 landing: the model's date digits in
+  its own order (month, day, year) squeezed into `YYYY`, which no engine can fix; with the format in the prompt the
+  constrained answer equals the free one (`tools/structured_check.py --agreement-only`). The chase did show two real
+  problems, both fixed:
+  - When none of the ranks' top-32 candidates was allowed, the lowest allowed token id was taken. Rank 0 now scans its own
+    half of the vocabulary under the mask on the host and checks whether the result is provably the best allowed token
+    (exact for that half; rank 1's half stays limited to its top 32, and the log counts rows it could not prove). A row with
+    one allowed token takes it outright.
+  - With thinking on, the grammar constrained the token straight after `</think>`, where a Qwen model writes `\n\n`, so
+    the model had to choose a digit, quote or letter where it expected a newline. The grammar now waits for the think end
+    and a short trail of tokens after it (the server sends `\n\n`), forced by a one-bit mask, and starts after them. Whether
+    this changed any reply in practice was not measured: it is correct by construction, not shown by a failing case.
 - **A first-token bug found by that run** (`0013`): the CUDA host's backend wrapper did not forward the masked first draw,
   so a grammar request with thinking off failed with HTTP 500 `StructuresUnsupported`. Fixed, with a host test that the
   wrapper forwards every optional call.
