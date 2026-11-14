@@ -481,6 +481,7 @@ checked and failed, 2 when it could not run, 3 when it ran but could not verify 
 | `tools/prompt_reuse.py [size] [turns]` | a conversation takes more turns, each resuming at least 90% of its prompt from the kept state |
 | `tools/exact.py` | the same greedy requests one at a time, with `"draft": false`, and all at once: the replies must be identical |
 | `tools/structured_check.py` | every structured-output kind returns a valid reply, drafted equals `"draft": false`, concurrent equals alone, and the malformed requests are refused |
+| `tools/structured_bench.py [--levels 1,4,16]` | decode tokens a second of a JSON reply under a schema against the same reply free, drafted and with `"draft": false`, alone and N at once |
 | `tools/client.py "message"` | one chat request (thinking off unless `--think`), for a quick look |
 
 ## Repository layout
