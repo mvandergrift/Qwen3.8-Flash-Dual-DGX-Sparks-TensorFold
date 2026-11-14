@@ -19,8 +19,13 @@ published for these patches (the v1.1 digest in `scripts/config.sh` does not app
   now also builds `libtfgrammar` from xgrammar v0.2.8 (`XGRAMMAR_REF` in `scripts/config.sh`). `tools/structured_check.py`
   checks it against a running server.
   **Status:** the lane core, the sampler, the lane backend and the two-rank mirror are covered by host tests (all pass on
-  Linux arm64; `libtfgrammar` was exercised against a real tokenizer), and the CUDA server cross-compiles. It has **not**
-  been run on a GB10 pair: run `tools/structured_check.py` before relying on it.
+  Linux arm64; `libtfgrammar` was exercised against a real tokenizer). On a two-Spark setup (NVFP4, 16 at once, 1M window)
+  `tools/structured_check.py` passes: every grammar kind valid, greedy and sampled, thinking off and on; drafted equal to
+  `"draft": false` in all 32 runs; 32 of 32 concurrent replies equal their run alone; the five refusals answered with HTTP
+  400. Not measured yet: the throughput of grammar replies, which draft from the prompt only.
+- **A first-token bug found by that run** (`0013`): the CUDA host's backend wrapper did not forward the masked first draw,
+  so a grammar request with thinking off failed with HTTP 500 `StructuresUnsupported`. Fixed, with a host test that the
+  wrapper forwards every optional call.
 
 ### Fixed
 - **A segfault in `endPass` under a full prompt cache, and a state rank 1 kept that rank 0 had freed**
