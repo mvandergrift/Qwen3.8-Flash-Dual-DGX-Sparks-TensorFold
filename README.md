@@ -436,7 +436,7 @@ These all work on the Flash Next TP=2 path; `"draft": false` gives the serial re
 `structured_outputs` are enforced with xgrammar, through `libtfgrammar` (TensorFold's shim, built into the image from
 xgrammar v0.2.8 and loaded when the first structured request arrives; a server without it still serves text and
 answers a structured request with HTTP 400 naming the library). With thinking on, the grammar starts after the
-thinking block closes. Patch `0013` brings this from TensorFold's lane core (PR #596) to this engine and applies
+thinking block closes and the blank lines (`\n\n`) the model writes after it, which the engine forces. Patch `0013` brings this from TensorFold's lane core (PR #596) to this engine and applies
 the per-draw masking idea of PR #1062; it is written for two ranks.
 
 How it works here: every token a grammar stream commits is drawn among the tokens its grammar allows. The mask is applied

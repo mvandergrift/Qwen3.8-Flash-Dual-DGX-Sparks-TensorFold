@@ -28,6 +28,11 @@ published for these patches (the v1.1 digest in `scripts/config.sh` does not app
   date regex answered `0256-07-20`. Rank 0 now scans its own half of the vocabulary under the mask on the host and
   checks whether the result is provably the best allowed token (exact for that half; rank 1's half stays limited to its
   top 32, and the log counts rows it could not prove). A row with one allowed token takes it outright.
+- **The grammar started too early with thinking on** (`0013`): it constrained the token straight after `</think>`, where a
+  Qwen model writes `\n\n`, so the model had to pick a digit, a quote or a letter where it expected a newline and its
+  scores meant nothing: a date regex answered `0256-07-20` for the 1969 landing (also with a 4,096-token thinking
+  budget, so not a cut-off). The grammar now waits for the think end and a short trail of tokens after it (the server
+  sends `\n\n`), forced by a one-bit mask, and starts after them.
 - **A first-token bug found by that run** (`0013`): the CUDA host's backend wrapper did not forward the masked first draw,
   so a grammar request with thinking off failed with HTTP 500 `StructuresUnsupported`. Fixed, with a host test that the
   wrapper forwards every optional call.

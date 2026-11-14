@@ -71,13 +71,16 @@ index 0000000..f59420d
 +    return out.items;
 +}
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
-index ec26b4a..f695a79 100644
+index ec26b4a..c431354 100644
 --- a/zig/src/core/engine_api.zig
 +++ b/zig/src/core/engine_api.zig
-@@ -47,8 +47,12 @@ pub const Structure = struct {
+@@ -47,8 +47,15 @@ pub const Structure = struct {
      text: []const u8 = "",
      /// With thinking on, the grammar starts after this token.
      after: ?u32 = null,
++    /// With thinking on, the tokens a model writes between the think end and its answer (blank lines): they follow the
++    /// think end, and the grammar starts after them.
++    trail: []const u32 = &.{},
 +    /// The server's compiler, which has compiled `text` once already (the engine's compile is then a cache hit).
 +    compiler: ?*grammar.Compiler = null,
  };
@@ -88,7 +91,7 @@ index ec26b4a..f695a79 100644
  pub const Media = lanes.Media;
  
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index 5f87384..6fdec71 100644
+index 5f87384..053ddc3 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
 @@ -211,7 +211,7 @@ pub const LaneHost = struct {
@@ -129,14 +132,16 @@ index 5f87384..6fdec71 100644
              job.proposer.deinit();
              return h.droppedJob(job, "out of memory");
          };
-@@ -341,6 +348,12 @@ pub const LaneHost = struct {
+@@ -341,6 +348,14 @@ pub const LaneHost = struct {
          return .{ .job = job };
      }
  
 +    /// A reply's grammar from the server's compiler (Info.structures engines get requests that carry one).
 +    fn constraint(h: *LaneHost, st: api.Structure) !*lanes.grammar.Constraint {
 +        const c = st.compiler orelse return error.NoGrammarCompiler;
-+        return c.constraint(h.gpa, h.io, @fromBackingInt(@intCast(@backingInt(st.kind))), st.text, st.after);
++        const g = try c.constraint(h.gpa, h.io, @fromBackingInt(@intCast(@backingInt(st.kind))), st.text, st.after);
++        g.trail = st.trail;
++        return g;
 +    }
 +
      fn droppedJob(h: *LaneHost, job: *Job, message: []const u8) Prep {
@@ -244,7 +249,7 @@ index dedaf63..567de18 100644
      fn queueNext(e: *Engine, s: *Stream, feed: Feed) !void {
          s.cache_len += 1;
 diff --git a/zig/src/core/lanes/engine_test.zig b/zig/src/core/lanes/engine_test.zig
-index 6177b99..f12e9b3 100644
+index 6177b99..c7be602 100644
 --- a/zig/src/core/lanes/engine_test.zig
 +++ b/zig/src/core/lanes/engine_test.zig
 @@ -6,6 +6,7 @@ const sm = @import("stream.zig");
@@ -284,7 +289,7 @@ index 6177b99..f12e9b3 100644
      defer target.deinit();
      var clock: fake.FixedClock = .{};
      var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
-@@ -36,9 +46,17 @@ fn run(cases: []const Case) ![][]u32 {
+@@ -36,9 +46,18 @@ fn run(cases: []const Case) ![][]u32 {
      defer gpa.free(streams);
      const proposers = try gpa.alloc(SuffixLookup, cases.len);
      defer gpa.free(proposers);
@@ -299,12 +304,13 @@ index 6177b99..f12e9b3 100644
 +        if (c.classes) |given| {
 +            g.* = given;
 +            k.* = .init(g.rules(), (fake.vocab + 31) / 32, given.after);
++            k.trail = given.trail;
 +        }
 +        s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .eos = c.eos, .sampling = c.sampling, .drafts = c.drafts, .proposer = p.proposer(), .think_budget = c.think_budget, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .grammar = if (c.classes != null) k else null });
      }
      defer for (streams, proposers) |*s, *p| {
          s.deinit(gpa);
-@@ -288,3 +306,64 @@ test "a cancelled fill ends without its stream joining" {
+@@ -288,3 +307,88 @@ test "a cancelled fill ends without its stream joining" {
      try std.testing.expectEqual(@as(usize, 0), engine.activeCount());
      try std.testing.expectEqual(@as(u32, 0), target.lanes.count());
  }
@@ -313,9 +319,17 @@ index 6177b99..f12e9b3 100644
 +fn expectInGrammar(emitted: []const u32, classes: Classes) !void {
 +    var g = classes;
 +    var active = g.after == null;
++    var lead: usize = 0; // trail tokens still to come after the think end
 +    for (emitted) |t| {
 +        if (!active) {
-+            active = t == g.after.?;
++            if (lead > 0) {
++                try std.testing.expectEqual(g.trail[g.trail.len - lead], t);
++                lead -= 1;
++                active = lead == 0;
++            } else if (t == g.after.?) {
++                lead = g.trail.len;
++                active = lead == 0;
++            }
 +            continue;
 +        }
 +        try std.testing.expect(g.allows(t));
@@ -363,6 +377,22 @@ index 6177b99..f12e9b3 100644
 +    try expectInGrammar(drafted[0], .{ .after = 91 });
 +}
 +
++test "structured output: with thinking and a trail the blank lines follow the think end and the grammar starts after them" {
++    const trail = [_]u32{ 7, 8 };
++    for ([_]?Sampling{ null, .{ .seed = 5, .temperature = 0.7, .top_k = 0, .top_p = 0.95 } }) |sampling| {
++        const c: Case = .{ .prompt = &p2, .think_budget = 9, .sampling = sampling, .classes = .{ .after = 91, .trail = &trail } };
++        const drafted = try run(&.{c});
++        defer free(drafted);
++        var plain_case = c;
++        plain_case.drafts = false;
++        const plain = try run(&.{plain_case});
++        defer free(plain);
++        try std.testing.expectEqualSlices(u32, plain[0], drafted[0]);
++        try std.testing.expectEqualSlices(u32, &.{ 90, 91, 7, 8 }, drafted[0][8..12]); // the close, then the trail
++        try expectInGrammar(drafted[0], .{ .after = 91, .trail = &trail });
++    }
++}
++
 +test "structured output: the grammar's stop token ends a reply that ignores eos" {
 +    const out = try run(&.{.{ .prompt = &p1, .eos = &.{}, .max_new = 200, .classes = .{ .length = 5 } }});
 +    defer free(out);
@@ -370,7 +400,7 @@ index 6177b99..f12e9b3 100644
 +    try expectInGrammar(out[0], .{ .length = 5 });
 +}
 diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
-index 4520fa2..7ad335e 100644
+index 4520fa2..e887c45 100644
 --- a/zig/src/core/lanes/fake.zig
 +++ b/zig/src/core/lanes/fake.zig
 @@ -6,6 +6,7 @@ const Stream = @import("stream.zig").Stream;
@@ -448,7 +478,7 @@ index 4520fa2..7ad335e 100644
              }
              l.history.shrinkRetainingCapacity(l.base);
              try l.history.appendSlice(x.gpa, l.rows.items); // a chain keeps every row unless rolled back
-@@ -282,3 +314,54 @@ pub const FixedClock = struct {
+@@ -282,3 +314,55 @@ pub const FixedClock = struct {
          return 6.0 + @as(f64, @floatFromInt(c.calls % 7)) * 0.5;
      }
  };
@@ -458,6 +488,7 @@ index 4520fa2..7ad335e 100644
 +pub const Classes = struct {
 +    length: u32 = 12,
 +    after: ?u32 = null,
++    trail: []const u32 = &.{},
 +    at: u32 = 0,
 +    done: bool = false,
 +
@@ -505,10 +536,10 @@ index 4520fa2..7ad335e 100644
 +};
 diff --git a/zig/src/core/lanes/grammar.zig b/zig/src/core/lanes/grammar.zig
 new file mode 100644
-index 0000000..699447d
+index 0000000..aa7f67f
 --- /dev/null
 +++ b/zig/src/core/lanes/grammar.zig
-@@ -0,0 +1,425 @@
+@@ -0,0 +1,490 @@
 +//! Structured output (Python engine/grammar.py): libtfgrammar (xgrammar, zig/src/grammar/tf_grammar.cc) loaded when
 +//! the first structured request arrives, and each stream's grammar as the round loop keeps it: it follows the
 +//! committed tokens, keeps the window rows an accepted path can use and fills each kept row's allowed-token bits.
@@ -686,7 +717,11 @@ index 0000000..699447d
 +pub const Constraint = struct {
 +    rules: Rules,
 +    words: usize,
-+    after: ?u32, // with thinking on, the grammar starts at the token after this one
++    after: ?u32, // with thinking on, the grammar starts after this token and `trail`
++    /// The tokens a thinking model writes between the think end and its answer (a template's blank lines): the reply's
++    /// first token after the think end is the first of them (only it is allowed), and the grammar starts after the last.
++    trail: []const u32 = &.{},
++    lead: ?usize = null, // while the trail is being followed: the next trail token's index
 +    active: bool,
 +
 +    pub fn init(rules: Rules, words: usize, after: ?u32) Constraint {
@@ -706,7 +741,13 @@ index 0000000..699447d
 +    /// Follow a committed token; false when the grammar rejects it (each is chosen under its mask, forced ones aside).
 +    pub fn follow(c: *Constraint, token: u32) !bool {
 +        if (!c.active) {
-+            c.active = token == c.after.?;
++            if (c.lead) |i| { // the trail: each token is the one its row's mask allowed
++                if (token != c.trail[i]) return false;
++                c.lead = if (i + 1 < c.trail.len) i + 1 else null;
++                c.active = c.lead == null;
++            } else if (token == c.after.?) {
++                if (c.trail.len > 0) c.lead = 0 else c.active = true;
++            }
 +            return true;
 +        }
 +        if (c.rules.vtable.terminated(c.rules.ptr)) return true;
@@ -715,9 +756,17 @@ index 0000000..699447d
 +
 +    /// The next token's bits on its own (a first token, or a one-row window); null when unconstrained.
 +    pub fn next(c: *Constraint, a: Allocator) !?[]u32 {
++        if (c.lead) |i| return try single(a, c.words, c.trail[i]);
 +        if (!c.active or c.finished()) return null;
 +        const bits = try a.alloc(u32, c.words);
 +        try c.rules.vtable.fill(c.rules.ptr, bits);
++        return bits;
++    }
++
++    fn single(a: Allocator, words: usize, token: u32) ![]u32 {
++        const bits = try a.alloc(u32, words);
++        @memset(bits, 0);
++        bits[token / 32] = @as(u32, 1) << @intCast(token % 32);
 +        return bits;
 +    }
 +
@@ -729,7 +778,7 @@ index 0000000..699447d
 +        const n = tokens.len;
 +        const all = try a.alloc(u32, n);
 +        for (all, 0..) |*r, i| r.* = @intCast(i);
-+        if (c.finished() or (!c.active and std.mem.indexOfScalar(u32, tokens[1..], c.after.?) == null))
++        if (c.finished() or (!c.active and c.lead == null and std.mem.indexOfScalar(u32, tokens[1..], c.after.?) == null))
 +            return .{ .rows = all, .parents = parents, .masks = &.{} }; // the reply has ended, or no row reaches the grammar
 +        const bits = try a.alloc(u32, n * c.words);
 +        @memset(bits, std.math.maxInt(u32));
@@ -737,7 +786,7 @@ index 0000000..699447d
 +        @memset(kept, forced);
 +        kept[0] = true;
 +        var walk: Walk = .{ .c = c, .tokens = tokens, .parents = parents, .bits = bits, .kept = kept };
-+        try walk.visit(0, c.active);
++        try walk.visit(0, if (c.active) .on else if (c.lead) |i| .{ .lead = i } else .before);
 +        var count: usize = 0;
 +        for (kept) |k| count += @intFromBool(k);
 +        const rows = try a.alloc(u32, count);
@@ -758,6 +807,9 @@ index 0000000..699447d
 +        return .{ .rows = rows, .parents = out_parents, .masks = masks };
 +    }
 +
++    /// Where a window's path stands: before the think end, following the trail (the next trail token's index), or in the grammar.
++    const Phase = union(enum) { before, lead: usize, on };
++
 +    const Walk = struct {
 +        c: *Constraint,
 +        tokens: []const u32,
@@ -766,25 +818,40 @@ index 0000000..699447d
 +        kept: []bool,
 +        filled: bool = false,
 +
-+        /// The matcher has taken row r's path (when `active`): fill its bits, then each child's.
-+        fn visit(w: *Walk, r: usize, active: bool) !void {
++        /// The path to row r is followed (the matcher has taken it when `on`): fill its bits, then each child's.
++        fn visit(w: *Walk, r: usize, phase: Phase) !void {
 +            const c = w.c;
-+            if (active) {
-+                try c.rules.vtable.fill(c.rules.ptr, w.bits[r * c.words ..][0..c.words]);
-+                w.filled = true;
++            const row = w.bits[r * c.words ..][0..c.words];
++            switch (phase) {
++                .on => try c.rules.vtable.fill(c.rules.ptr, row),
++                .lead => |i| {
++                    @memset(row, 0);
++                    row[c.trail[i] / 32] = @as(u32, 1) << @intCast(c.trail[i] % 32);
++                },
++                .before => {},
 +            }
++            w.filled = w.filled or phase != .before;
 +            for (w.parents[1..], 1..) |p, child| {
 +                if (p != @as(i32, @intCast(r))) continue;
-+                if (!active) {
-+                    w.kept[child] = true;
-+                    try w.visit(child, w.tokens[child] == c.after.?);
-+                } else if (try c.rules.vtable.accept(c.rules.ptr, w.tokens[child])) {
-+                    if (!c.rules.vtable.terminated(c.rules.ptr)) {
++                const token = w.tokens[child];
++                switch (phase) {
++                    .before => {
 +                        w.kept[child] = true;
-+                        try w.visit(child, true);
-+                    }
-+                    try c.rules.vtable.rollback(c.rules.ptr, 1);
-+                } // rejected: forced rows stay, unconstrained (kept and all set from the start)
++                        const after: Phase = if (c.after != null and token == c.after.?) (if (c.trail.len > 0) .{ .lead = 0 } else .on) else .before;
++                        try w.visit(child, after);
++                    },
++                    .lead => |i| if (token == c.trail[i]) { // the only token its row allowed
++                        w.kept[child] = true;
++                        try w.visit(child, if (i + 1 < c.trail.len) .{ .lead = i + 1 } else .on);
++                    },
++                    .on => if (try c.rules.vtable.accept(c.rules.ptr, token)) {
++                        if (!c.rules.vtable.terminated(c.rules.ptr)) {
++                            w.kept[child] = true;
++                            try w.visit(child, .on);
++                        }
++                        try c.rules.vtable.rollback(c.rules.ptr, 1);
++                    }, // rejected: forced rows stay, unconstrained (kept and all set from the start)
++                }
 +            }
 +        }
 +    };
@@ -898,6 +965,35 @@ index 0000000..699447d
 +    try std.testing.expectEqualSlices(u32, &.{ std.math.maxInt(u32), 1 << 5, 1 << 2 }, w.masks);
 +    try std.testing.expect(try c.follow(30));
 +    try std.testing.expect(c.active and !try c.follow(4));
++    try std.testing.expect(try c.follow(5) and try c.follow(2) and c.finished());
++}
++
++test "a trail after the think end is forced by a one-bit mask, and the grammar starts after it" {
++    const gpa = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var seq: Sequence = .{ .want = &.{5}, .stop = 2, .gpa = gpa };
++    defer seq.log.deinit(gpa);
++    var c: Constraint = .init(seq.rules(), 1, 30);
++    c.trail = &.{ 8, 9 }; // the blank lines
++    // drafts: the think end, the trail, then the grammar's 5 and its stop token
++    const w = try c.window(a, &.{ 7, 30, 8, 9, 5, 2 }, &.{ -1, 0, 1, 2, 3, 4 }, false);
++    // (the stop token's own row is not verified)
++    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4 }, w.rows);
++    // before the think end nothing is masked; the think end's row allows only the first trail token, that one the second,
++    // the second the grammar's first token; then its stop token
++    try std.testing.expectEqualSlices(u32, &.{ std.math.maxInt(u32), 1 << 8, 1 << 9, 1 << 5, 1 << 2 }, w.masks);
++    // a draft that is not the trail's first token goes with its rows
++    const off = try c.window(a, &.{ 7, 30, 5 }, &.{ -1, 0, 1 }, false);
++    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, off.rows);
++    // following the tokens: the trail's rows are exactly its tokens, a different one is refused, the grammar then runs
++    try std.testing.expect(try c.follow(30));
++    try std.testing.expectEqualSlices(u32, &.{1 << 8}, (try c.next(a)).?);
++    try std.testing.expect(try c.follow(8));
++    try std.testing.expect(!try c.follow(5));
++    try std.testing.expect(try c.follow(9));
++    try std.testing.expectEqualSlices(u32, &.{1 << 5}, (try c.next(a)).?);
 +    try std.testing.expect(try c.follow(5) and try c.follow(2) and c.finished());
 +}
 +
@@ -2191,7 +2287,7 @@ index d9793a8..3748e3c 100644
          .default_max_tokens = args.max_tokens,
          .enable_thinking = args.thinking,
 diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
-index d383b62..d0782c8 100644
+index d383b62..9ceb6aa 100644
 --- a/zig/src/server/server.zig
 +++ b/zig/src/server/server.zig
 @@ -24,6 +24,7 @@ const Allocator = std.mem.Allocator;
@@ -2221,7 +2317,7 @@ index d383b62..d0782c8 100644
          srv.arena.deinit();
          srv.store.deinit();
          srv.gpa.destroy(srv);
-@@ -151,10 +157,48 @@ pub const Server = struct {
+@@ -151,10 +157,50 @@ pub const Server = struct {
          }
          if (try grammar.spec(cx, f)) |s| {
              if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
@@ -2231,7 +2327,9 @@ index d383b62..d0782c8 100644
 +            const compiled = c.compile(srv.io, @fromBackingInt(@intCast(@backingInt(s.kind))), s.text, &err) catch
 +                return cx.fail(.request, "{s}: the grammar cannot be enforced: {s}", .{ s.field, std.mem.sliceTo(&err, 0) });
 +            compiled.free(); // kept in the compiler's cache for the engine's compile
-+            request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null, .compiler = c };
++            // a thinking model writes blank lines between `</think>` and its answer: they are not the grammar's
++            const trail: []const u32 = if (thinking) (srv.text.encode(cx.a, "\n\n", false) catch &.{}) else &.{};
++            request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null, .trail = trail, .compiler = c };
          }
      }
  
