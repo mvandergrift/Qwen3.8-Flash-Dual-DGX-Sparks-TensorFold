@@ -3,7 +3,7 @@
 
     python3 tools/structured_bench.py [--url http://127.0.0.1:8888] [--levels 1,4,16] [--runs 3]
 
-The same request three ways, greedy, thinking off, a JSON reply of about 600 tokens:
+The same request three ways, greedy, thinking off, a JSON reply of about 1,500 tokens:
   free, drafted       no grammar (the MTP head and copy drafts on: the server's normal speed)
   free, draft:false   no grammar, no drafts (what a grammar reply is compared with: it drafts from the prompt only)
   json_schema         the same reply under a JSON schema (response_format)

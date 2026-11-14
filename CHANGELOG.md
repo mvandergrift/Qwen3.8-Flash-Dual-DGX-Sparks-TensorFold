@@ -22,7 +22,9 @@ published for these patches (the v1.1 digest in `scripts/config.sh` does not app
   Linux arm64; `libtfgrammar` was exercised against a real tokenizer). On a two-Spark setup (NVFP4, 16 at once, 1M window)
   `tools/structured_check.py` passes: every grammar kind valid, greedy and sampled, thinking off and on; drafted equal to
   `"draft": false` in all 32 runs; 32 of 32 concurrent replies equal their run alone; the five refusals answered with HTTP
-  400. Not measured yet: the throughput of grammar replies, which draft from the prompt only.
+  400. Throughput of grammar replies, which draft from the prompt only
+  (`tools/structured_bench.py`, per request at 1 / 4 / 16 at once): 27.2 / 28.3 / 18.0 tokens a second under a JSON schema
+  against 107.7 / 76.8 / 43.0 for drafted free text and 29.9 / 25.1 / 17.9 for free text with `"draft": false`.
 - **Two weaknesses found while chasing a wrong-looking date** (`0013`). A date regex asked of a model that was never told
   the format (`Give the date.`) answered `0256-07-20` and later `7201-07-20` for the 1969 landing: the model's date digits in
   its own order (month, day, year) squeezed into `YYYY`, which no engine can fix; with the format in the prompt the
