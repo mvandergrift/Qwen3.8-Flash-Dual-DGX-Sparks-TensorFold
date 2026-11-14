@@ -29,8 +29,13 @@ published for these patches (the v1.1 digest in `scripts/config.sh` does not app
   stream, because the lane backend never gave the round loop the head's drafted chain (the 2.4-4x measured above). It now
   reads that chain, which it keeps in host memory, for streams with a grammar only; the loop walks it through the grammar and
   verifies the rows the grammar allows, dropping the first rejected draft and the rows after it. Streams without a grammar
-  read nothing, so their rounds are as before. A host test fails with the chain hidden. The speedup was not measured when
-  this was written: run `tools/structured_bench.py`.
+  read nothing, so their rounds are as before. A host test fails with the chain hidden. Measured on a two-Spark setup
+  (`tools/structured_bench.py`, 25 cities as JSON, greedy, thinking off, median of 3, per request at 1 / 4 / 16 at once):
+  107.3 / 70.7 / 40.1 tokens a second under a JSON schema against 107.6 / 71.2 / 46.7 for drafted free text and
+  29.7 / 25.1 / 17.9 for free text with `"draft": false`: 1.00x / 0.99x / 0.86x of drafted free text and 3.6x / 2.8x / 2.2x
+  of the figure a grammar reply had before. All three replies were 1,577 tokens and the grammar's was the expected JSON in
+  every run; `tools/structured_check.py --agreement-only` passes (the free answer equals the constrained one, thinking off
+  and on). This is one workload, a schema a model follows closely: a schema full of free text will gain less.
 - **Two weaknesses found while chasing a wrong-looking date** (`0013`). A date regex asked of a model that was never told
   the format (`Give the date.`) answered `0256-07-20` and later `7201-07-20` for the 1969 landing: the model's date digits in
   its own order (month, day, year) squeezed into `YYYY`, which no engine can fix; with the format in the prompt the

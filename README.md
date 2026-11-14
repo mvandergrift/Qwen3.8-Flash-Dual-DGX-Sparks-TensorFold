@@ -458,6 +458,10 @@ What to know:
   grammar and verifies the rows it allows, dropping the first draft it rejects with the rows after it, so a grammar the model
   follows keeps most of the head's speedup and one it fights keeps less. `tools/structured_bench.py` measures it: the same
   JSON reply under a schema, free with drafts, and free with `"draft": false` (the figure a grammar reply must beat).
+  On two Sparks (25 cities as JSON, greedy, thinking off, per request at 1 / 4 / 16 at once) a JSON schema ran at
+  107.3 / 70.7 / 40.1 tokens a second against 107.6 / 71.2 / 46.7 for drafted free text and 29.7 / 25.1 / 17.9 with
+  `"draft": false`. One workload; a schema full of free text gains less, and the gap grows with the requests at once
+  (0.86x at 16; its cause was not investigated).
 - **Unconstrained requests take the path they took before**: their draws, drafts and token hashes are produced by the same code.
 - `tools/structured_check.py` checks all of it against a running server: every grammar kind valid, drafted equal to
   `"draft": false`, concurrent equal to alone, and the refusals.
