@@ -1907,10 +1907,23 @@ index 0000000..98347c2
 +
 +}  // extern "C"
 diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
-index f1af70c..71e6d66 100644
+index f1af70c..499f30a 100644
 --- a/zig/src/native/cuda.zig
 +++ b/zig/src/native/cuda.zig
-@@ -285,7 +285,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+@@ -120,6 +120,12 @@ const Host = struct {
+                     return x.inner.vtable.first(x.inner.ptr, s, position);
+                 }
+             }.f,
++            .first_masked = if (v.first_masked != null) struct {
++                fn f(p: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
++                    const x = bind(p);
++                    return x.inner.vtable.first_masked.?(x.inner.ptr, s, position, mask);
++                }
++            }.f else null,
+             .queue = struct {
+                 fn f(p: *anyopaque, s: *lanes.Stream, feed: lanes.backend.Feed, position: u64) anyerror!u64 {
+                     const x = bind(p);
+@@ -285,7 +291,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
      h.clock = .{ .io = io };
      h.core = lanes.Engine.init(gpa, &h.cfg, h.backend(), h.clock.clock());
      errdefer h.core.deinit();
@@ -1919,6 +1932,22 @@ index f1af70c..71e6d66 100644
      h.store = null;
      if (@hasField(@TypeOf(loaded), "cache")) if (loaded.cache) |c| if (c.budget > 0) {
          // the family keeps and restores the states; the store picks them (exact reuse, core/prompt_cache.zig)
+@@ -309,3 +315,15 @@ test "every registered family is listed for capabilities" {
+     try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
+     try std.testing.expectEqualStrings("qwen4_exp", families[1].model_type);
+ }
++
++test "the host's backend forwards every optional call the family's backend has, structured output's first draw included" {
++    var fk: lanes.fake.Fake = .{ .gpa = std.testing.allocator };
++    defer fk.deinit();
++    var h: Host = undefined;
++    h.inner = fk.backend();
++    const b = h.backend();
++    inline for (@typeInfo(lanes.backend.Backend.VTable).@"struct".field_names) |name| {
++        if (@typeInfo(@FieldType(lanes.backend.Backend.VTable, name)) == .optional)
++            try std.testing.expectEqual(@field(h.inner.vtable, name) != null, @field(b.vtable, name) != null);
++    }
++}
 diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
 index 3cef0f4..67dc001 100644
 --- a/zig/src/server/main.zig
