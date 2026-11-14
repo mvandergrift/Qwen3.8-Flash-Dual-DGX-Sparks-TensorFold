@@ -454,18 +454,10 @@ What to know:
   best allowed token. The log says so (`structured output: N masked rows not proven the best allowed token`, the first few
   times, then every 1000th, with the counts of rows forced, settled by the candidates, settled by rank 0's shard and
   unproven). A row with no allowed token among anything rank 0 can see takes the lowest allowed id.
-- **Grammar replies draft from the prompt only**: the MTP head's drafts are not verified under a grammar, so the
-  speedup the head gives text does not apply (copy drafts from the prompt still do). Measured with
-  `tools/structured_bench.py` (25 cities as JSON, about 1,500 tokens, greedy, NVFP4), tokens a second per request:
-
-  | | 1 at once | 4 at once | 16 at once |
-  | --- | ---: | ---: | ---: |
-  | free text, drafted | 107.7 | 76.8 | 43.0 |
-  | free text, `"draft": false` | 29.9 | 25.1 | 17.9 |
-  | `json_schema` | 27.2 | 28.3 | 18.0 |
-
-  A schema decodes as fast as text without drafts (0.91x at one request, about 1.0x at 16): the masking is nearly free, and
-  what a grammar gives up is the head's drafts, 0.25x of drafted text for one user and 0.42x at 16.
+- **The MTP head's drafts are verified under a grammar.** The round loop walks the head's drafted chain through the
+  grammar and verifies the rows it allows, dropping the first draft it rejects with the rows after it, so a grammar the model
+  follows keeps most of the head's speedup and one it fights keeps less. `tools/structured_bench.py` measures it: the same
+  JSON reply under a schema, free with drafts, and free with `"draft": false` (the figure a grammar reply must beat).
 - **Unconstrained requests take the path they took before**: their draws, drafts and token hashes are produced by the same code.
 - `tools/structured_check.py` checks all of it against a running server: every grammar kind valid, drafted equal to
   `"draft": false`, concurrent equal to alone, and the refusals.
