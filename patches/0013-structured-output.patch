@@ -249,18 +249,19 @@ index dedaf63..567de18 100644
      fn queueNext(e: *Engine, s: *Stream, feed: Feed) !void {
          s.cache_len += 1;
 diff --git a/zig/src/core/lanes/engine_test.zig b/zig/src/core/lanes/engine_test.zig
-index 6177b99..c7be602 100644
+index 6177b99..1c25a05 100644
 --- a/zig/src/core/lanes/engine_test.zig
 +++ b/zig/src/core/lanes/engine_test.zig
-@@ -6,6 +6,7 @@ const sm = @import("stream.zig");
+@@ -6,6 +6,8 @@ const sm = @import("stream.zig");
  const fake = @import("fake.zig");
  const SuffixLookup = @import("proposer.zig").SuffixLookup;
  const Sampling = @import("sampling.zig").Sampling;
 +const grammar = @import("grammar.zig");
++const win = @import("windows.zig");
  
  const gpa = std.testing.allocator;
  
-@@ -15,8 +16,12 @@ const Case = struct {
+@@ -15,8 +17,12 @@ const Case = struct {
      sampling: ?Sampling = null,
      drafts: bool = true,
      think_budget: u32 = 0,
@@ -273,7 +274,7 @@ index 6177b99..c7be602 100644
  fn model() !Config {
      var costs: [16]@import("config.zig").Cost = undefined;
      for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 0.8 * @as(f64, @floatFromInt(w)) };
-@@ -25,9 +30,14 @@ fn model() !Config {
+@@ -25,9 +31,14 @@ fn model() !Config {
  
  /// Every case's emitted tokens, the cases admitted together and stepped until done.
  fn run(cases: []const Case) ![][]u32 {
@@ -289,7 +290,7 @@ index 6177b99..c7be602 100644
      defer target.deinit();
      var clock: fake.FixedClock = .{};
      var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
-@@ -36,9 +46,18 @@ fn run(cases: []const Case) ![][]u32 {
+@@ -36,9 +47,18 @@ fn run(cases: []const Case) ![][]u32 {
      defer gpa.free(streams);
      const proposers = try gpa.alloc(SuffixLookup, cases.len);
      defer gpa.free(proposers);
@@ -310,7 +311,7 @@ index 6177b99..c7be602 100644
      }
      defer for (streams, proposers) |*s, *p| {
          s.deinit(gpa);
-@@ -288,3 +307,88 @@ test "a cancelled fill ends without its stream joining" {
+@@ -288,3 +308,108 @@ test "a cancelled fill ends without its stream joining" {
      try std.testing.expectEqual(@as(usize, 0), engine.activeCount());
      try std.testing.expectEqual(@as(u32, 0), target.lanes.count());
  }
@@ -336,6 +337,26 @@ index 6177b99..c7be602 100644
 +        _ = try Classes.acceptFn(&g, t);
 +    }
 +    try std.testing.expect(g.done);
++}
++
++test "structured output: a held chain the head does not give back leaves a plain round, not a head round without drafts" {
++    var cfg = try model();
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa }; // not ranked: no alternatives to walk
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer engine.deinit();
++    var g: Classes = .{};
++    var k: grammar.Constraint = .init(g.rules(), (fake.vocab + 31) / 32, null);
++    var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &p1, .max_new = 8, .eos = &.{96}, .grammar = &k });
++    defer s.deinit(gpa);
++    s.pending = 3;
++    var plan: win.Plan = .{ .stream = &s, .position = 0, .kind = .head, .held = 3 };
++    try win.constrain(&engine, &plan);
++    try std.testing.expectEqual(win.Kind.none, plan.kind);
++    try std.testing.expectEqual(@as(usize, 0), plan.count());
++    try std.testing.expectEqual(k.words, plan.masks.len); // the pending row is still masked
 +}
 +
 +test "structured output: drafted rounds commit the one-token decode, every token inside the grammar" {
@@ -1103,7 +1124,7 @@ index 1e3c65f..17d3201 100644
              if (s.isEos(t) or s.stopped()) {
                  s.finished = true;
 diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
-index a76e4ed..c3c77c1 100644
+index a76e4ed..3730bf4 100644
 --- a/zig/src/core/lanes/windows.zig
 +++ b/zig/src/core/lanes/windows.zig
 @@ -27,6 +27,7 @@ pub const Plan = struct {
@@ -1114,7 +1135,7 @@ index a76e4ed..c3c77c1 100644
  
      pub fn count(p: Plan) usize {
          return p.held + p.tokens.len;
-@@ -212,6 +213,48 @@ pub fn nodeChances(e: *Engine, s: *Stream, n: usize) ![]const f64 {
+@@ -212,6 +213,52 @@ pub fn nodeChances(e: *Engine, s: *Stream, n: usize) ![]const f64 {
      return alloc.chainProbabilities(a, try e.rule.rates(who(s)), n);
  }
  
@@ -1129,6 +1150,7 @@ index a76e4ed..c3c77c1 100644
 +            if (p.parents) |q| if (q[k] != @as(i32, @intCast(k)) - 1) break null;
 +        } else (try headTrunk(e, p.stream, p.*, p.held)) orelse null;
 +        if (chain) |c| {
++            std.debug.assert(c.tokens.len == p.held); // headTrunk: every held level or null, so the parents still fit
 +            p.tokens = try std.mem.concat(a, u32, &.{ c.tokens, p.tokens });
 +        } else {
 +            p.tokens = &.{};
@@ -1143,6 +1165,10 @@ index a76e4ed..c3c77c1 100644
 +    @memcpy(rows[1..], p.tokens);
 +    const w = try g.window(a, rows, try accept.rowParents(a, rows.len, p.parents), p.kind == .forced);
 +    p.masks = w.masks;
++    // no draft left to verify (an unread held chain or tree, or none the grammar takes): a plain round, as allocate leaves one
++    defer if (p.count() == 0 and p.kind != .forced) {
++        p.kind = .none;
++    };
 +    if (w.rows.len == rows.len) return;
 +    const kept = try a.alloc(u32, w.rows.len - 1);
 +    for (kept, w.rows[1..]) |*t, r| t.* = rows[r];
@@ -1157,13 +1183,12 @@ index a76e4ed..c3c77c1 100644
 +        for (w.rows) |r| below += @intFromBool(r < p.branch_from);
 +        p.branch_from = below;
 +    }
-+    if (kept.len == 0 and p.kind != .forced) p.kind = .none;
 +}
 +
  /// The window's rows, parents and keyed positions, ready for the backend.
  pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
      const a = e.arena.allocator();
-@@ -220,7 +263,7 @@ pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
+@@ -220,7 +267,7 @@ pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
      const ds = try accept.depths(a, parents);
      const positions = try a.alloc(u64, rows);
      for (positions, ds) |*x, d| x.* = p.position + 1 + d;
@@ -1173,11 +1198,16 @@ index a76e4ed..c3c77c1 100644
  
  pub fn rowParents(e: *Engine, w: be.Window) ![]const i32 {
 diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
-index 9f2ec3a..89c218d 100644
+index 9f2ec3a..60a6ac0 100644
 --- a/zig/src/families/flashnext/cuda_engine.zig
 +++ b/zig/src/families/flashnext/cuda_engine.zig
-@@ -310,6 +310,8 @@ pub const Engine = struct {
+@@ -308,8 +308,13 @@ pub const Engine = struct {
+     cand_host: std.ArrayList(f32) = .empty,
+     cand_round: u64 = 0,
      cand_have: u64 = std.math.maxInt(u64),
++    /// structured output's host scratch, kept between masked draws: a window's candidate rows, a row of this rank's shard
++    mask_cand: std.ArrayList(f32) = .empty,
++    mask_shard: std.ArrayList(u16) = .empty,
      /// TF_FLASHNEXT_DRAW_ONCE=0: each window's and draft's draws read the candidates again (the old way)
      draw_once: bool = true,
 +    /// structured output: what the masked draws did so far (rank 0), for the log
@@ -1185,7 +1215,16 @@ index 9f2ec3a..89c218d 100644
      /// generateMany's served hybrid (gate-many --served): a running product applies while at most this many streams
      /// are live, `wide_confidence` above (maxInt: the request's rule always)
      product_streams: usize = std.math.maxInt(usize),
-@@ -794,6 +796,8 @@ pub const Engine = struct {
+@@ -628,6 +633,8 @@ pub const Engine = struct {
+         e.extra.buf.free();
+         if (e.prof) |p| p.deinit(e.gpa);
+         e.cand_host.deinit(e.gpa);
++        e.mask_cand.deinit(e.gpa);
++        e.mask_shard.deinit(e.gpa);
+         e.memo.deinit();
+         if (e.px) |*q| q.deinit();
+         if (e.k8) |*q| q.deinit();
+@@ -794,6 +801,8 @@ pub const Engine = struct {
          resume_from: ?*const Snapshot = null,
          /// the prompt's images and video frames (Python prefill(..., vision=)): fresh prompts only, nothing kept
          media: ?*const lanes.Media = null,
@@ -1194,15 +1233,15 @@ index 9f2ec3a..89c218d 100644
      };
  
      pub const Prefilled = struct { first: u32, kept: ?*Snapshot = null };
-@@ -987,6 +991,7 @@ pub const Engine = struct {
+@@ -987,6 +996,7 @@ pub const Engine = struct {
          e.f.finishMedia(seq);
          var first: [1]u32 = undefined;
          try e.draw(e.last_logits, e.last_cand, 1, prompt.len, &first);
-+        if (o.mask.len > 0) try e.maskDraw(e.last_cand, e.last_logits, 1, 0, 1, prompt.len, e.sampling, o.mask, &first);
++        if (o.mask.len > 0) try e.maskDraw(e.last_cand, false, e.last_logits, 1, 0, 1, prompt.len, e.sampling, o.mask, &first);
          if (e.pass_times) {
              pw[3] = try e.passLap(&t_pw);
              if (e.rank == 0) std.log.info("prefillWith {d} tokens{s}{s}: restore {d:.1} ms, {d} forwards {d:.1} ms, absorbs + commits {d:.1} ms, draw {d:.1} ms", .{ prompt.len, if (o.resume_from != null) " (resumed)" else "", if (o.keep_at != null) " (kept)" else "", pw[0], pw_chunks, pw[1], pw[2], pw[3] });
-@@ -1011,7 +1016,7 @@ pub const Engine = struct {
+@@ -1011,7 +1021,7 @@ pub const Engine = struct {
      }
  
      /// One prompt of a burst (prefillMany).
@@ -1211,15 +1250,15 @@ index 9f2ec3a..89c218d 100644
  
      /// Whether `prefillMany` can take these prompts as one pass: two to `state.max_rows` prompts whose rows fit the
      /// prompt buffers together (each a whole prompt, from reset).
-@@ -1070,6 +1075,7 @@ pub const Engine = struct {
+@@ -1070,6 +1080,7 @@ pub const Engine = struct {
          for (prompts, 0..) |p, i| {
              const s: ?lanes.Sampling = if (p.sampling) |x| (if (x.temperature > 0) x else null) else null;
              try e.drawRows(lg, pb.b.cand_all, n, i, 1, p.prompt.len, s, firsts[i .. i + 1]);
-+            if (p.mask.len > 0) try e.maskDraw(pb.b.cand_all, lg, n, i, 1, p.prompt.len, s, p.mask, firsts[i .. i + 1]);
++            if (p.mask.len > 0) try e.maskDraw(pb.b.cand_all, false, lg, n, i, 1, p.prompt.len, s, p.mask, firsts[i .. i + 1]);
          }
      }
  
-@@ -1079,6 +1085,7 @@ pub const Engine = struct {
+@@ -1079,6 +1090,7 @@ pub const Engine = struct {
          seq: *Seq,
          prompt: []u32,
          sampling: ?lanes.Sampling,
@@ -1227,7 +1266,7 @@ index 9f2ec3a..89c218d 100644
          keep_at: ?usize,
          use_mtp: bool,
          start: usize,
-@@ -1102,6 +1109,8 @@ pub const Engine = struct {
+@@ -1102,6 +1114,8 @@ pub const Engine = struct {
          errdefer e.gpa.destroy(fl);
          fl.* = .{ .seq = seq, .prompt = try e.gpa.dupe(u32, prompt), .sampling = if (sampling) |x| (if (x.temperature > 0) x else null) else null, .keep_at = o.keep_at, .use_mtp = e.absorbing and e.w.mtp != null, .start = 0 };
          errdefer e.gpa.free(fl.prompt);
@@ -1236,7 +1275,7 @@ index 9f2ec3a..89c218d 100644
          if (o.resume_from) |snap| {
              if (!(snap.pos > 0 and snap.pos < prompt.len)) return error.ResumeMustExtend;
              if (!std.mem.eql(u32, snap.tokens, prompt[0..snap.pos])) return error.ResumeOtherPrompt;
-@@ -1120,6 +1129,7 @@ pub const Engine = struct {
+@@ -1120,6 +1134,7 @@ pub const Engine = struct {
          if (e.pfill == fl) e.pfill = null;
          if (fl.kept) |k| e.freeSnapshot(k);
          e.gpa.free(fl.prompt);
@@ -1244,27 +1283,48 @@ index 9f2ec3a..89c218d 100644
          e.gpa.destroy(fl);
      }
  
-@@ -1184,6 +1194,7 @@ pub const Engine = struct {
+@@ -1184,6 +1199,7 @@ pub const Engine = struct {
                  e.f.finishMedia(seq);
                  var first: [1]u32 = undefined;
                  try e.drawRows(e.last_logits, e.last_cand, 1, 0, 1, fl.prompt.len, fl.sampling, &first);
-+                if (fl.mask.len > 0) try e.maskDraw(e.last_cand, e.last_logits, 1, 0, 1, fl.prompt.len, fl.sampling, fl.mask, &first);
++                if (fl.mask.len > 0) try e.maskDraw(e.last_cand, false, e.last_logits, 1, 0, 1, fl.prompt.len, fl.sampling, fl.mask, &first);
                  fl.first = first[0];
                  fl.done = true;
                  return true;
-@@ -1362,6 +1373,74 @@ pub const Engine = struct {
+@@ -1352,16 +1368,100 @@ pub const Engine = struct {
+         const total = e.round_segs[e.round_n - 1].a1;
+         if (e.world > 1 and e.draw_once and sampler.gatheredFits(smp)) {
+             // the round's candidates read once (one wait), every window's draws from the host copy
+-            if (e.cand_have != e.cand_round) {
+-                try e.cand_host.resize(e.gpa, e.world * total * (2 * state.cand + 1));
+-                try e.read(e.buf.b.cand_all, std.mem.sliceAsBytes(e.cand_host.items));
+-                e.cand_have = e.cand_round;
+-            }
+-            return e.chooseFrom(e.cand_host.items, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
++            return e.chooseFrom(try e.roundCands(total), total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
+         }
          try e.drawRows(e.buf.b.logits, e.buf.b.cand_all, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
      }
  
++    /// The shared round's gathered candidates [world][total][2 CAND + 1] on the host, read once a round.
++    fn roundCands(e: *Engine, total: usize) ![]const f32 {
++        if (e.cand_have != e.cand_round) {
++            try e.cand_host.resize(e.gpa, e.world * total * (2 * state.cand + 1));
++            try e.read(e.buf.b.cand_all, std.mem.sliceAsBytes(e.cand_host.items));
++            e.cand_have = e.cand_round;
++        }
++        return e.cand_host.items;
++    }
++
 +    /// `sampleWindow` for a stream under a grammar: the same draws (rank 1 makes them unmasked, with their
-+    /// collectives), then each row redrawn within its allowed-token bits `masks` (rows x words).
++    /// collectives), then each constrained row redrawn within its allowed-token bits `masks` (rows x words).
 +    pub fn sampleWindowMasked(e: *Engine, i: usize, s: ?lanes.Sampling, masks: []const u32, out: []u32) !void {
 +        try e.sampleWindow(i, s, out);
 +        if (masks.len == 0) return;
 +        const sg = e.round_segs[i];
 +        const smp: ?lanes.Sampling = if (s) |x| (if (x.temperature > 0) x else null) else null;
 +        const total = e.round_segs[e.round_n - 1].a1;
-+        try e.maskDraw(e.buf.b.cand_all, e.buf.b.logits, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, masks, out);
++        try e.maskDraw(e.buf.b.cand_all, e.draw_once, e.buf.b.logits, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, masks, out);
 +    }
 +
 +    /// Structured output: rows [row0, row0 + rows) of a forward's `total` rows redrawn over the gathered candidates the
@@ -1272,19 +1332,30 @@ index 9f2ec3a..89c218d 100644
 +    /// already, so the collectives a draw has stay paired with rank 1's, which draws unmasked and whose draws nothing
 +    /// reads. A row the ranks' top CAND candidates do not settle takes this rank's own vocabulary shard from `logits_base`
 +    /// (the forward's rows, this rank's shard each), scanned on the host under the mask; see sampler.chooseGatheredMasked.
-+    fn maskDraw(e: *Engine, cand_all: u64, logits_base: u64, total: usize, row0: usize, rows: usize, first_position: u64, s: ?lanes.Sampling, masks: []const u32, out: []u32) !void {
++    /// A row whose bits are all set (before the think end, or past a forced token the grammar rejected) keeps its plain
++    /// draw in `out`, so a drafted window draws those rows as an undrafted one does; with no row constrained nothing is read.
++    /// `round`: the forward is the shared round's, whose candidates the host keeps (one read however many streams have a
++    /// grammar, the one the plain draws make); otherwise only this window's rows of each rank are read.
++    fn maskDraw(e: *Engine, cand_all: u64, round: bool, logits_base: u64, total: usize, row0: usize, rows: usize, first_position: u64, s: ?lanes.Sampling, masks: []const u32, out: []u32) !void {
 +        if (e.world < 2) return error.StructuresNeedTwoRanks;
 +        if (rows > state.max_rows or masks.len % rows != 0) return error.GatheredShape;
++        const words = masks.len / rows;
++        for (0..rows) |r| {
++            if (!sampler.unconstrained(masks[r * words ..][0..words])) break;
++        } else return;
 +        const width = 2 * state.cand + 1;
-+        const all = try e.gpa.alloc(f32, e.world * total * width);
-+        defer e.gpa.free(all);
-+        try e.read(cand_all, std.mem.sliceAsBytes(all));
-+        const got = try e.gpa.alloc(f32, e.world * rows * width);
-+        defer e.gpa.free(got);
-+        for (0..e.world) |r| @memcpy(got[r * rows * width ..][0 .. rows * width], all[(r * total + row0) * width ..][0 .. rows * width]);
++        const host: ?[]const f32 = if (round) try e.roundCands(total) else null;
++        try e.mask_cand.resize(e.gpa, e.world * rows * width);
++        const got = e.mask_cand.items;
++        for (0..e.world) |k| {
++            const mine = got[k * rows * width ..][0 .. rows * width];
++            const at = (k * total + row0) * width;
++            if (host) |all| @memcpy(mine, all[at..][0 .. rows * width]) else try e.read(cand_all + at * @sizeOf(f32), std.mem.sliceAsBytes(mine));
++        }
 +        var positions: [state.max_rows]u64 = undefined;
 +        var draws: [state.max_rows]sampler.Draw = undefined;
 +        for (0..rows) |r| positions[r] = first_position + r;
++        for (draws[0..rows], out[0..rows]) |*d, o| d.* = .{ .token = o }; // the plain draws, which unconstrained rows keep
 +        var shard: LocalShard = .{ .e = e, .logits = logits_base, .row0 = row0 };
 +        var stats: sampler.MaskStats = .{};
 +        try sampler.chooseGatheredMasked(e.gpa, got, e.world, rows, positions[0..rows], s, masks, shard.scan(), draws[0..rows], &stats);
@@ -1317,8 +1388,8 @@ index 9f2ec3a..89c218d 100644
 +            const self: *LocalShard = @ptrCast(@alignCast(ctx));
 +            const e = self.e;
 +            const V = e.g.head_n;
-+            const host = try e.gpa.alloc(u16, V);
-+            defer e.gpa.free(host);
++            try e.mask_shard.resize(e.gpa, V);
++            const host = e.mask_shard.items;
 +            try e.read(self.logits + (self.row0 + row) * V * 2, std.mem.sliceAsBytes(host));
 +            return sampler.topAllowed(host, @intCast(e.f.vocab_offset), bits, values, ids);
 +        }
@@ -1328,7 +1399,7 @@ index 9f2ec3a..89c218d 100644
      pub fn commitWindow(e: *Engine, i: usize, keep: usize) !void {
          if (i >= e.round_n) return error.NoSuchWindow;
 diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
-index f045479..21a8c62 100644
+index f045479..cd15c68 100644
 --- a/zig/src/families/flashnext/cuda_lanes.zig
 +++ b/zig/src/families/flashnext/cuda_lanes.zig
 @@ -188,12 +188,14 @@ pub fn Lanes(comptime E: type) type {
@@ -1446,14 +1517,16 @@ index f045479..21a8c62 100644
                  @memcpy(o.drafts[0 .. rows - 1], ids[i][1..rows]);
                  l.held_n = 0;
                  l.pending_rows = rows;
-@@ -990,6 +1027,19 @@ pub fn Lanes(comptime E: type) type {
+@@ -990,6 +1027,21 @@ pub fn Lanes(comptime E: type) type {
              return .{ .count = @intCast(l.held_n) };
          }
  
 +        /// A stream under a grammar: its held chain's tokens, which the round loop walks through the grammar (core/lanes/
 +        /// windows.zig constrain) so the head's drafts a grammar allows are verified, as the host's own drafts are. Other
-+        /// streams read nothing, so nothing about their rounds changes. The head's second to fourth choices are not
-+        /// kept (this backend builds no trees): they repeat the chain's token.
++        /// streams read nothing, so nothing about their rounds changes. The chain is on the host once `draft` returns
++        /// (`verify` reads the same `held`), so there is nothing to wait for. The head's second to fourth choices are
++        /// not kept (this backend builds no trees): they repeat the chain's token, which grafts nothing (fill.graft
++        /// leaves a trunk only at a ranked token that differs from its own), and the probabilities are not the head's.
 +        fn alternativesFn(ptr: *anyopaque, s: *lanes.Stream, out: []be.Alternative) anyerror!usize {
 +            const self = of(ptr);
 +            if (s.grammar == null) return 0;
@@ -1466,7 +1539,7 @@ index f045479..21a8c62 100644
          fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
              const self = of(ptr);
              const kv = self.lanes.fetchRemove(s) orelse return;
-@@ -1302,7 +1352,7 @@ pub const Toy = struct {
+@@ -1302,7 +1354,7 @@ pub const Toy = struct {
      // -- kept prompt states (cuda_engine's Snapshot, prefillWith, copyPrefix, freeSnapshot) --
  
      pub const Snapshot = struct { pos: usize, mtp_len: usize, tokens: []u32 };
@@ -1475,7 +1548,7 @@ index f045479..21a8c62 100644
      pub const Prefilled = struct { first: u32, kept: ?*Snapshot = null };
  
      /// The prompt from 0, or from a kept state of this sequence (its first pos rows the prompt's), keeping the
-@@ -1332,7 +1382,7 @@ pub const Toy = struct {
+@@ -1332,7 +1384,7 @@ pub const Toy = struct {
              kept = snap;
          }
          t.passes += 1;
@@ -1484,7 +1557,7 @@ index f045479..21a8c62 100644
      }
  
      /// cuda_engine's Fill: a prompt filling in layer slices; here `left` layers, then prefillWith's effect.
-@@ -1341,6 +1391,7 @@ pub const Toy = struct {
+@@ -1341,6 +1393,7 @@ pub const Toy = struct {
          prompt: []u32,
          sampling: ?lanes.Sampling,
          opts: PrefillOptions,
@@ -1492,7 +1565,7 @@ index f045479..21a8c62 100644
          left: usize = 5,
          kept: ?*Snapshot = null,
          first: u32 = 0,
-@@ -1351,6 +1402,8 @@ pub const Toy = struct {
+@@ -1351,6 +1404,8 @@ pub const Toy = struct {
          if (prompt.len == 0 or prompt.len > q.limit) return error.ToyMisuse;
          const fl = try t.gpa.create(Fill);
          fl.* = .{ .seq = q, .prompt = try t.gpa.dupe(u32, prompt), .sampling = sampling, .opts = o };
@@ -1501,7 +1574,7 @@ index f045479..21a8c62 100644
          t.fills += 1;
          return fl;
      }
-@@ -1373,6 +1426,7 @@ pub const Toy = struct {
+@@ -1373,6 +1428,7 @@ pub const Toy = struct {
      pub fn fillFree(t: *Toy, fl: *Fill) void {
          if (fl.kept) |k| t.freeSnapshot(k);
          t.gpa.free(fl.prompt);
@@ -1509,7 +1582,7 @@ index f045479..21a8c62 100644
          t.gpa.destroy(fl);
          t.fills -= 1;
      }
-@@ -1437,6 +1491,23 @@ pub const Toy = struct {
+@@ -1437,6 +1493,23 @@ pub const Toy = struct {
          t.forwards += 1;
          t.widest = @max(t.widest, windows.len);
      }
@@ -1533,7 +1606,7 @@ index f045479..21a8c62 100644
      pub fn sampleWindow(t: *Toy, i: usize, s: ?lanes.Sampling, out: []u32) !void {
          if (i >= t.round_n) return error.ToyMisuse;
          const w = t.round_windows[i];
-@@ -1994,3 +2065,154 @@ test "a state the store evicts during the pass that kept it is left out of rank
+@@ -1994,3 +2067,154 @@ test "a state the store evicts during the pass that kept it is left out of rank
          try std.testing.expectEqual(@as(usize, 0), t.seqs);
      }
  }
@@ -1810,10 +1883,10 @@ index f20517a..6c53962 100644
  /// --vision: rank 0's vision helper (tensorfold.vision.native_helper) encodes on this GPU beside the engine; its
  /// transient workspace is kept out of the sequences' budget (TENSORFOLD_VISION_WORKSPACE_MIB, 4096 by default
 diff --git a/zig/src/families/flashnext/cuda_sampler.zig b/zig/src/families/flashnext/cuda_sampler.zig
-index b1bd422..b4d0800 100644
+index b1bd422..4f9bf8c 100644
 --- a/zig/src/families/flashnext/cuda_sampler.zig
 +++ b/zig/src/families/flashnext/cuda_sampler.zig
-@@ -91,6 +91,136 @@ pub fn chooseGathered(gpa: Allocator, got: []const f32, world: usize, rows: usiz
+@@ -91,6 +91,146 @@ pub fn chooseGathered(gpa: Allocator, got: []const f32, world: usize, rows: usiz
      }
  }
  
@@ -1839,6 +1912,8 @@ index b1bd422..b4d0800 100644
 +/// not certified takes rank 0's shard from `scan` (exact, so that shard stops limiting it) and is checked again; one that
 +/// still is not is drawn over what there is (`stats.inexact`). A row with one allowed token takes it; a row with none among
 +/// the candidates takes the lowest allowed id (`stats.missed`). The mask only removes tokens: the reply stays in the grammar.
++/// A row whose bits are all set (`unconstrained`) is not redrawn: `out[r]` keeps the plain draw the caller put there,
++/// which for top_k 0 or a top_k past the candidates is over the whole vocabulary, as no draw over the candidates is.
 +pub fn chooseGatheredMasked(gpa: Allocator, got: []const f32, world: usize, rows: usize, positions: []const u64, s: ?S.Sampling, masks: []const u32, scan: ?ShardScan, out: []Draw, stats: *MaskStats) !void {
 +    const width = 2 * cand + 1;
 +    if (got.len < world * rows * width or positions.len != rows or out.len != rows or rows == 0 or masks.len % rows != 0) return error.GatheredShape;
@@ -1851,6 +1926,7 @@ index b1bd422..b4d0800 100644
 +    var scan_id: [scan_width]u64 = undefined;
 +    for (0..rows) |r| {
 +        const bits = masks[r * words ..][0..words];
++        if (unconstrained(bits)) continue;
 +        var popcount: usize = 0;
 +        for (bits) |w| popcount += @popCount(w);
 +        if (popcount == 0) return error.NoAllowedToken;
@@ -1936,6 +2012,13 @@ index b1bd422..b4d0800 100644
 +    return reach >= need;
 +}
 +
++/// A row's bits are all set: the grammar does not constrain it (a row before the think end, or one past a forced token
++/// the grammar rejected: grammar.Window), so its draw is the plain one.
++pub fn unconstrained(bits: []const u32) bool {
++    for (bits) |w| if (w != std.math.maxInt(u32)) return false;
++    return true;
++}
++
 +fn allowedBit(bits: []const u32, token: usize) bool {
 +    return token / 32 < bits.len and (bits[token / 32] >> @intCast(token % 32)) & 1 == 1;
 +}
@@ -1950,7 +2033,7 @@ index b1bd422..b4d0800 100644
  test "gathered draws and probabilities equal Python's choose_gathered" {
      const gpa = std.testing.allocator;
      const text = @embedFile("fixtures_cuda_gathered.json");
-@@ -148,3 +278,133 @@ test "the gathered candidates cover top_k 20 and greedy, not top_k 30" {
+@@ -148,3 +288,161 @@ test "the gathered candidates cover top_k 20 and greedy, not top_k 30" {
      try std.testing.expect(!gatheredFits(.{ .seed = 1, .top_k = 0 }));
      try std.testing.expect(gatheredFits(.{ .seed = 1, .temperature = 0 }));
  }
@@ -2011,6 +2094,34 @@ index b1bd422..b4d0800 100644
 +    try std.testing.expectEqual(@as(u64, 3), out[0].token);
 +    try std.testing.expectEqual(@as(u64, 250), out[1].token);
 +    try std.testing.expectEqual(MaskStats{ .forced = 1, .certified = 1 }, stats);
++    try std.testing.expectEqual(@as(usize, 0), shard.calls);
++}
++
++test "a row the grammar leaves unconstrained keeps the plain draw it came with, beside a constrained row that is redrawn" {
++    const gpa = std.testing.allocator;
++    const width = 2 * cand + 1;
++    var got: [2 * 2 * width]f32 = undefined;
++    testCandidates(&got, 2);
++    // row 0 all set (before the think end); row 1 the grammar's
++    var masks: [2 * W]u32 = @splat(0);
++    @memset(masks[0..W], std.math.maxInt(u32));
++    setBits(masks[W..], &.{ 3, 7, 1003 });
++    try std.testing.expect(unconstrained(masks[0..W]) and !unconstrained(masks[W..]));
++    var shard: TestShard = .{};
++    // greedy over the candidates would take 0 (value 40): the plain draw's 777 stays, as a whole-vocabulary draw's would
++    var out: [2]Draw = .{ .{ .token = 777 }, .{ .token = 778 } };
++    var stats: MaskStats = .{};
++    try chooseGatheredMasked(gpa, &got, 2, 2, &.{ 5, 6 }, null, &masks, shard.scan(), &out, &stats);
++    try std.testing.expectEqual(@as(u64, 777), out[0].token);
++    try std.testing.expectEqual(@as(u64, 3), out[1].token);
++    try std.testing.expectEqual(MaskStats{ .certified = 1 }, stats);
++    // top_k 0, which the candidates do not cover: an unconstrained row is not drawn, scanned or counted
++    const nucleus: S.Sampling = .{ .seed = 3, .temperature = 1.0, .top_k = 0, .top_p = 0.95 };
++    var one: [1]Draw = .{.{ .token = 777 }};
++    stats = .{};
++    try chooseGatheredMasked(gpa, &got, 2, 1, &.{5}, nucleus, masks[0..W], shard.scan(), &one, &stats);
++    try std.testing.expectEqual(@as(u64, 777), one[0].token);
++    try std.testing.expectEqual(MaskStats{}, stats);
 +    try std.testing.expectEqual(@as(usize, 0), shard.calls);
 +}
 +
